@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+*.db
+_tmp_*.py
+.idea/
+.vscode/
+*.log
+
+# 逆向过程产物（浏览器用户数据含 cookies，严禁入库）
+chrome-data/
+samples/
+screenshots/
