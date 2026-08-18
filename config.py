@@ -22,9 +22,6 @@ _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 # ==================== 原有配置（Gamma API / SQLite 事件市场评论采集） ====================
 
-# SQLite 数据库路径（原有事件/市场/评论库，交易采集仅只读引用其 conditionId）
-DB_PATH = os.path.join(os.path.dirname(__file__), 'polymarket.db')
-
 GAMMA_API_BASE = 'https://gamma-api.polymarket.com'
 POLYMARKET_BASE = 'https://polymarket.com'
 
@@ -51,6 +48,12 @@ MIN_COMMENT_COUNT = 0
 # Data API（交易与活动流，无需鉴权）
 DATA_API_BASE = 'https://data-api.polymarket.com'
 
+# CLOB API（价格历史/盘口深度/时间）
+CLOB_API_BASE = 'https://clob.polymarket.com'
+
+# 登录态 Cookie 文件（浏览器登录后 export_cookie.py 导出，评论全量采集用）
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.json')
+
 # 本地 PostgreSQL（新建库 polymarket，与 yelp/dailymail 等库同实例）
 # 连接信息从 .env / 环境变量读取（参考 .env.example），密码不硬编码
 PG_HOST = os.environ.get('PG_HOST', 'localhost')
@@ -69,6 +72,23 @@ POLYGON_RPC_URLS = [
     'https://polygon-bor-rpc.publicnode.com',
     'https://1rpc.io/matic',
 ]
+
+# Gamma API 全模块采集参数
+TAGS_PAGE_SIZE = 100             # /tags 单页条数
+KEYSET_PAGE_SIZE = 100           # /events/keyset 单页条数
+MARKETS_PAGE_SIZE = 100          # /markets 单页条数
+CLARIFICATIONS_BATCH = 100       # 规则澄清并发批量
+
+# Data API 全模块采集参数
+HOLDERS_PAGE_SIZE = 100          # /holders 单页条数
+POSITIONS_PAGE_SIZE = 50         # /v1/market-positions 单页条数
+
+# 评论采集参数（登录态下才能翻页看全）
+COMMENTS_LIMIT = 50              # /comments 单页条数（未登录服务端可能只回 10）
+
+# CLOB 价格历史参数
+PRICE_FIDELITY_DAILY = 720       # 日级/跨天：fidelity=720（5 分钟粒度）
+PRICE_FIDELITY_INTRADAY = 10     # 近 24h：fidelity=10（10 秒粒度）
 
 # Data API 采集参数
 # /trades: limit<=10000, offset<=10000；/activity: limit<=500, offset<=5000

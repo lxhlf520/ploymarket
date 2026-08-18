@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """交易批量采集 - Phase A 全市场交易 / Phase B 用户活动流
 
-Phase A: 从现有 SQLite markets 表（只读）取全部 conditionId，逐市场拉 /trades 全量历史
+Phase A: 从 condition_ids.txt（58k+ conditionId 种子）逐市场拉 /trades 全量历史
 Phase B: 从 PG trades 表取去重后的 proxyWallet，逐用户拉 /activity 全量
          （补 usdcSize/type 及 REDEEM/MERGE 等非 TRADE 活动，与 Phase A 自然键去重）
 
@@ -10,10 +10,8 @@ Phase B: 从 PG trades 表取去重后的 proxyWallet，逐用户拉 /activity �
 """
 
 import asyncio
-import json
 import logging
 import os
-import sqlite3
 import time
 
 from tqdm import tqdm
@@ -45,33 +43,15 @@ CONDITION_IDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'c
 
 
 def load_condition_ids() -> list:
-    """读取去重 conditionId 种子：优先 condition_ids.txt（部署机无 SQLite 时），
-    回退从本地 SQLite markets 表提取（只读不改）"""
-    if os.path.exists(CONDITION_IDS_FILE):
-        with open(CONDITION_IDS_FILE, encoding='utf-8') as f:
-            seen = set()
-            ids = []
-            for line in f:
-                cid = line.strip()
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    ids.append(cid)
-        return ids
-    conn = sqlite3.connect(f'file:{config.DB_PATH}?mode=ro', uri=True)
-    cur = conn.cursor()
-    cur.execute('SELECT raw_json FROM markets')
+    """读取去重 conditionId 种子（condition_ids.txt 纯文本，Phase A 数据源）"""
     seen = set()
     ids = []
-    for (raw,) in cur.fetchall():
-        try:
-            obj = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        cid = obj.get('conditionId')
-        if cid and cid not in seen:
-            seen.add(cid)
-            ids.append(cid)
-    conn.close()
+    with open(CONDITION_IDS_FILE, encoding='utf-8') as f:
+        for line in f:
+            cid = line.strip()
+            if cid and cid not in seen:
+                seen.add(cid)
+                ids.append(cid)
     return ids
 
 

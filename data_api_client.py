@@ -154,6 +154,84 @@ class DataAPIClient:
             config.ACTIVITY_PAGE_SIZE, on_batch=on_batch,
         )
 
+    async def fetch_holders(self, market: str, on_batch=None) -> int:
+        """拉取单个市场全部 Top Holders。
+
+        实测响应为列表 [{token, holders: [...]}]（按 token 分组），
+        展平为每行带 token_id 的 holder 记录后回调 on_batch。
+        """
+        offset = 0
+        total = 0
+        guard = 0
+        while True:
+            data = await self._get_page('/holders', {
+                'market': market,
+                'limit': config.HOLDERS_PAGE_SIZE,
+                'offset': offset,
+            })
+            if not data:
+                break
+            rows = []
+            for group in data:
+                tid = group.get('token')
+                for h in group.get('holders') or []:
+                    h['token_id'] = tid
+                    rows.append(h)
+            if on_batch and rows:
+                await on_batch(rows)
+            total += len(rows)
+            guard += 1
+            if len(rows) < config.HOLDERS_PAGE_SIZE or guard > 2000:
+                break
+            offset += config.HOLDERS_PAGE_SIZE
+        return total
+
+    async def fetch_market_positions(self, market: str, on_batch=None) -> int:
+        """拉取单个市场持仓快照（每 token 组 Top limit 条，offset 实测无效无法翻页）。
+    
+        实测响应 [{token, positions: [...]}]（按 token 分组），offset 参数被忽略
+        （多次请求返回相同数据），故只拉 1 页即可，展平后补 condition_id/token_id。
+        """
+        data = await self._get_page('/v1/market-positions', {
+            'market': market,
+            'limit': config.POSITIONS_PAGE_SIZE,
+            'offset': 0,
+            'status': 'ALL',
+        })
+        if isinstance(data, dict):
+            data = data.get('data') or []
+        if not data:
+            return 0
+        rows = []
+        for group in data:
+            token_id = group.get('token')
+            for pos in group.get('positions') or []:
+                pos['condition_id'] = market
+                if not pos.get('token_id'):
+                    pos['token_id'] = token_id
+                rows.append(pos)
+        if on_batch and rows:
+            await on_batch(rows)
+        return len(rows)
+
+    async def fetch_event_trades(self, event_id, on_batch=None) -> int:
+        """拉取单个事件全部 CASH 交易（Activity 维度）。
+
+        实测 /trades?eventId= 响应行无 eventId 字段（仅 eventSlug），
+        入库前统一补充 eventId。沿用 end 窗口翻页突破 offset 上限。
+        """
+        async def _wrap(page):
+            for r in page:
+                if r.get('eventId') is None:
+                    r['eventId'] = str(event_id)
+            if on_batch:
+                await on_batch(page)
+
+        return await self.fetch_all(
+            '/trades', {'eventId': event_id, 'filterType': 'CASH'},
+            config.TRADES_PAGE_SIZE, on_batch=_wrap,
+        )
+
     async def probe_page(self, path: str, params: dict) -> list:
         """拉取单个页面（--dry-run 估算用），返回行列表"""
         return await self._get_page(path, params)

@@ -11,3 +11,6 @@ _tmp_*.py
 chrome-data/
 samples/
 screenshots/
+
+# 登录态 Cookie（export_cookie.py 导出，严禁入库）
+cookies.json
