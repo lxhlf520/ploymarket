@@ -127,25 +127,38 @@ async def _scrape_positions(api: DataAPIClient, condition_id: str, sem: asyncio.
             pbar.set_postfix(inserted=stats.inserted, failed=stats.failures)
 
 
+async def collect_event_activity(api: DataAPIClient, event_id: str) -> tuple:
+    """单事件全量 CASH 交易采集（worker 与单机模式共用）。
+
+    fetch_event_trades 深翻页 + 攒批 upsert_trades，返回 (total, inserted, updated)，失败抛异常。
+    """
+    batch = []
+    counters = {'ins': 0, 'upd': 0}
+
+    async def on_batch(page):
+        batch.extend(page)
+        if len(batch) >= BATCH_ROWS:
+            ins, upd = await db_pg.upsert_trades(batch)
+            counters['ins'] += ins
+            counters['upd'] += upd
+            batch.clear()
+
+    total = await api.fetch_event_trades(event_id, on_batch=on_batch)
+    if batch:
+        ins, upd = await db_pg.upsert_trades(batch)
+        counters['ins'] += ins
+        counters['upd'] += upd
+        batch.clear()
+    return total, counters['ins'], counters['upd']
+
+
 async def _scrape_activity(api: DataAPIClient, event_id: str, sem: asyncio.Semaphore,
                            pbar: tqdm, stats: Stats) -> None:
     async with sem:
-        batch = []
-
-        async def on_batch(page):
-            batch.extend(page)
-            if len(batch) >= BATCH_ROWS:
-                ins, upd = await db_pg.upsert_trades(batch)
-                stats.inserted += ins
-                stats.updated += upd
-                batch.clear()
-
         try:
-            total = await api.fetch_event_trades(event_id, on_batch=on_batch)
-            if batch:
-                ins, upd = await db_pg.upsert_trades(batch)
-                stats.inserted += ins
-                stats.updated += upd
+            total, ins, upd = await collect_event_activity(api, event_id)
+            stats.inserted += ins
+            stats.updated += upd
             await db_pg.mark_scope_done(f'activity:{event_id}', total)
         except Exception as exc:
             stats.failures += 1

@@ -52,12 +52,14 @@ class DataAPIClient:
     # 各端点的 offset 上限（窗口内翻页保护）
     MAX_OFFSETS = {'/trades': 10000, '/activity': 5000}
 
-    def __init__(self, base_url: str = None, bucket: TokenBucket = None):
+    def __init__(self, base_url: str = None, bucket: TokenBucket = None,
+                 proxy: str = None):
         self.base_url = base_url or config.DATA_API_BASE
         self.bucket = bucket or TokenBucket()
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.DATA_TIMEOUT, connect=15),
             headers=config.HEADERS,
+            proxy=proxy,
             limits=httpx.Limits(
                 max_connections=config.TRADES_CONCURRENCY + 8,
                 max_keepalive_connections=config.TRADES_CONCURRENCY,

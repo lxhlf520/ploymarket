@@ -92,3 +92,56 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 2. **限流**：Data API 全局 200 req/10s（代码令牌桶对齐）；Cloudflare 可能阶段性升级限流，中断冷却后续跑即可
 3. **RPC 限额**：Phase C 数百万次请求，`config.POLYGON_RPC_URLS` 可追加带免费 key 的节点（Alchemy/QuickNode）大幅提速；备选公共节点为非归档节点，仅作故障轮换
 4. **耗时**：全量中性估计约 4-7 天（A 半天 / B 1-2 天 / C 2-5 天），断点续传支持跨天分批推进
+
+## 分布式多任务采集（activity/trades）
+
+> 当前主入口为 `main_collect.py`（全模块采集）；本章节为 trades 全量采集的多进程并行方案。
+
+### 原理
+
+- Data API 限流（200 req/10s）按**出口 IP** 计——单机加线程无益，**多 worker 进程各走独立隧道代理**（独立出口 IP）才能线性扩吞吐
+- 任务队列存 PG `activity_tasks` 表（event 级状态机：`pending 等待 → running 采集中 → done 完成 / failed 错误`）
+- 领取用 `FOR UPDATE SKIP LOCKED` 原子操作：多 worker 并发领取**永不重复**；worker 被强杀后其 running 任务**租约超时自动回收**，其他 worker 接管
+- 多 worker 写同一 PG 库：trades upsert 幂等，无脏数据
+
+### 启动
+
+多开 PowerShell 窗口，每个窗口一个 worker、各带不同代理端口：
+
+```powershell
+# 窗口 1
+python worker_activity.py --proxy http://127.0.0.1:7890 --worker-id w1 --jobs 3
+
+# 窗口 2
+python worker_activity.py --proxy http://127.0.0.1:7891 --worker-id w2 --jobs 3
+
+# 窗口 3（直连）
+python worker_activity.py --worker-id w3 --jobs 3
+
+# 或一键启动（start_workers.bat，按需改代理端口）
+start_workers.bat
+```
+
+参数：`--proxy`（本进程出口代理，不填=直连）、`--jobs`（同时采的事件数，默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）。
+
+### 状态监控
+
+```sql
+SELECT status, count(*) FROM activity_tasks GROUP BY status;
+
+-- 看当前谁在采什么
+SELECT event_id, worker_id, lease_until, attempts FROM activity_tasks WHERE status = 'running';
+
+-- 排查失败原因
+SELECT event_id, attempts, last_error FROM activity_tasks WHERE status = 'failed';
+
+-- 失败任务重新入队（人工排查后）
+UPDATE activity_tasks SET status = 'pending', attempts = 0 WHERE status = 'failed';
+```
+
+### 注意事项
+
+1. **不要混跑**：worker 模式与 `main_collect.py --stage activity` 单机模式使用不同进度表（`activity_tasks` vs `scrape_progress`），同时跑会重复采集（幂等不脏数据，但浪费配额）。worker 启动时会把 `scrape_progress` 中已完成的 done 断点**单向迁移**进任务队列
+2. **代理要求**：每个 worker 一个独立出口 IP 的隧道代理；多个 worker 共用同一出口 IP 无扩展效果（限流共享）
+3. **jobs 建议 2-4**：单 IP 配额 200 req/10s，jobs 过大只是排队
+4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；强杀场景租约超时（默认 15 分钟）自动回收

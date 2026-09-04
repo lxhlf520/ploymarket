@@ -229,6 +229,18 @@ CREATE TABLE IF NOT EXISTS orderbook (
     PRIMARY KEY (token_id, side, price, snapshot_at)
 );
 
+CREATE TABLE IF NOT EXISTS activity_tasks (
+    event_id        TEXT PRIMARY KEY,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    worker_id       TEXT,
+    lease_until     TIMESTAMPTZ,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    rows            BIGINT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_activity_tasks_status ON activity_tasks (status, event_id);
+
 -- 存量表补列（幂等）
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS event_id TEXT;
 ALTER TABLE markets ADD COLUMN IF NOT EXISTS tags JSONB;
@@ -437,6 +449,16 @@ COMMENT ON COLUMN orderbook.side IS '方向（BUY/SELL，主键之一）';
 COMMENT ON COLUMN orderbook.price IS '价格（主键之一）';
 COMMENT ON COLUMN orderbook.size IS '数量（主键之一）';
 COMMENT ON COLUMN orderbook.snapshot_at IS '快照时间（主键之一）';
+
+COMMENT ON TABLE activity_tasks IS 'activity 分布式任务队列（event 级状态机，多 worker 进程共用）';
+COMMENT ON COLUMN activity_tasks.event_id IS '事件 ID（主键）';
+COMMENT ON COLUMN activity_tasks.status IS '状态：pending 等待采集 / running 采集中（带租约） / done 完成 / failed 错误死信';
+COMMENT ON COLUMN activity_tasks.worker_id IS '当前持有者 worker 标识（hostname:pid）';
+COMMENT ON COLUMN activity_tasks.lease_until IS '租约到期时间（超时未完成视为 worker 宕机，可被重新领取）';
+COMMENT ON COLUMN activity_tasks.attempts IS '已尝试次数';
+COMMENT ON COLUMN activity_tasks.last_error IS '最近一次失败原因';
+COMMENT ON COLUMN activity_tasks.rows IS '采集到的交易行数';
+COMMENT ON COLUMN activity_tasks.updated_at IS '最后更新时间';
 """
 
 UPSERT_TRADES_SQL = """
@@ -1058,6 +1080,118 @@ async def mark_scope_done(scope: str, fetched_count: int) -> None:
         )
 
     await execute_with_retry(_do)
+
+
+# ==================== activity 分布式任务队列（event 级状态机） ====================
+
+async def init_activity_tasks() -> dict:
+    """从 events 表灌入任务队列（幂等）：
+    - scrape_progress 中 activity:{eid} 已 done 的直接标 done（单向迁移旧断点）
+    - 其余 pending；已存在的行不重置（ON CONFLICT DO NOTHING）
+    """
+    async def _do(conn):
+        res = await conn.execute(
+            """
+            INSERT INTO activity_tasks (event_id, status)
+            SELECT e.id,
+                   CASE WHEN p.scope IS NOT NULL THEN 'done' ELSE 'pending' END
+            FROM events e
+            LEFT JOIN scrape_progress p
+                   ON p.scope = 'activity:' || e.id AND p.state = 'done'
+            ON CONFLICT (event_id) DO NOTHING
+            """
+        )
+        return {'queued': int(res.split()[-1]) if res else 0}
+
+    out = await execute_with_retry(_do)
+    stats = await activity_task_stats()
+    if out['queued']:
+        logger.info('activity_tasks 新增 %s 任务，当前状态: %s', out['queued'], stats)
+    return {**out, 'stats': stats}
+
+
+async def claim_activity_task(worker_id: str, lease_minutes: int = 15):
+    """原子领取一个任务（pending 或租约超时的 running），置 running 并续租。
+
+    FOR UPDATE SKIP LOCKED 保证多 worker 并发领取不重复；
+    返回 {event_id, attempts} 或 None（队列空）。
+    """
+    async def _do(conn):
+        row = await conn.fetchrow(
+            """
+            WITH candidate AS (
+                SELECT event_id
+                FROM activity_tasks
+                WHERE status = 'pending'
+                   OR (status = 'running' AND lease_until < now())
+                ORDER BY event_id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE activity_tasks t
+            SET status = 'running',
+                worker_id = $1,
+                lease_until = now() + make_interval(mins => $2),
+                attempts = t.attempts + 1,
+                updated_at = now()
+            FROM candidate
+            WHERE t.event_id = candidate.event_id
+            RETURNING t.event_id, t.attempts
+            """,
+            worker_id, lease_minutes,
+        )
+        return dict(row) if row else None
+
+    return await execute_with_retry(_do)
+
+
+async def complete_activity_task(event_id: str, rows: int) -> None:
+    """任务完成：标 done 并记录行数"""
+    async def _do(conn):
+        await conn.execute(
+            """
+            UPDATE activity_tasks
+            SET status = 'done', rows = $2, last_error = NULL,
+                worker_id = NULL, lease_until = NULL, updated_at = now()
+            WHERE event_id = $1
+            """,
+            event_id, rows,
+        )
+
+    await execute_with_retry(_do)
+
+
+async def fail_activity_task(event_id: str, err: str, max_attempts: int = 5) -> str:
+    """任务失败：attempts+1；达上限标 failed（死信），否则回 pending 待重试。返回新状态"""
+    async def _do(conn):
+        return await conn.fetchval(
+            """
+            UPDATE activity_tasks
+            SET attempts = attempts + 1,
+                last_error = left($2, 500),
+                status = CASE WHEN attempts + 1 >= $3 THEN 'failed' ELSE 'pending' END,
+                worker_id = NULL, lease_until = NULL, updated_at = now()
+            WHERE event_id = $1
+            RETURNING status
+            """,
+            event_id, err, max_attempts,
+        )
+
+    return await execute_with_retry(_do)
+
+
+async def activity_task_stats() -> dict:
+    """任务队列状态统计 {pending, running, done, failed}"""
+    async def _do(conn):
+        res = await conn.fetch(
+            "SELECT status, count(*) AS n FROM activity_tasks GROUP BY status"
+        )
+        stats = {'pending': 0, 'running': 0, 'done': 0, 'failed': 0}
+        for r in res:
+            stats[r['status']] = r['n']
+        return stats
+
+    return await execute_with_retry(_do)
 
 
 async def get_pending_wallets(limit: int) -> list:
