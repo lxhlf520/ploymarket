@@ -14,3 +14,6 @@ screenshots/
 
 # 登录态 Cookie（export_cookie.py 导出，严禁入库）
 cookies.json
+
+# worker 专用 mihomo 配置（含机场节点凭据 uuid，严禁入库；由 make_worker_clash.py 生成）
+clash_worker/

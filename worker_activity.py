@@ -6,9 +6,12 @@
 - 领取：claim_activity_task 原子领取（FOR UPDATE SKIP LOCKED），多 worker 并发不重复
 - 租约：running 超时自动回收——worker 被强杀后其任务由其他 worker 接管
 - 出口：每进程经 --proxy 走独立隧道代理（独立出口 IP → 独立 200 req/10s 限流配额）
+- 限流自动切节点（可选）：--clash-base 指向 worker 专用 mihomo 实例的 controller，
+  429 累计 3 次/403 → ban 当前节点与出口 IP → 自动切下一节点继续采集
+  （配合 make_worker_clash.py 生成配置，实现多实例并行轮换，详见 README）
 
 用法（多开 PowerShell 窗口，各带不同代理端口）：
-    python worker_activity.py --proxy http://127.0.0.1:7890
+    python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1
     python worker_activity.py --proxy http://127.0.0.1:7891 --worker-id w2 --jobs 3
     python worker_activity.py --idle-wait 0          # 队列空即退出（一次性模式）
 
@@ -26,6 +29,7 @@ import time
 from tqdm import tqdm
 
 import config
+import clash_pool
 import db_pg
 import scraper_data
 from data_api_client import DataAPIClient, TokenBucket
@@ -54,21 +58,45 @@ def parse_args():
                         help='单事件最大尝试次数，超过标 failed 死信（默认 5）')
     parser.add_argument('--idle-wait', type=int, default=30,
                         help='队列空时轮询间隔秒（默认 30；0=队列空即退出）')
+    parser.add_argument('--clash-base', default=None,
+                        help='mihomo controller 地址（如 http://127.0.0.1:9101）；'
+                             '配置后启用限流自动切节点（需 --proxy 指向同一实例 mixed 端口）')
+    parser.add_argument('--clash-secret', default='pm-worker',
+                        help='mihomo external-controller secret（默认 pm-worker）')
+    parser.add_argument('--clash-group', default='PM',
+                        help='mihomo selector 组名（默认 PM）')
+    parser.add_argument('--rotate-after', type=int, default=150,
+                        help='每 N 次请求主动轮换节点（默认 150；0=仅限流时切换）')
     return parser.parse_args()
 
 
 async def amain(args):
     # 幂等初始化任务队列（单向迁移 scrape_progress 的 activity done 断点）
     init = await db_pg.init_activity_tasks()
-    logger.info('worker %s 启动 (proxy=%s, jobs=%s) 队列初始: %s',
-                args.worker_id, args.proxy or '直连', args.jobs, init['stats'])
+
+    # 节点轮换器：--clash-base 指向 worker 专用 mihomo 实例时启用
+    rotator = None
+    if args.clash_base:
+        api = clash_pool.ClashAPI(base=args.clash_base, secret=args.clash_secret,
+                                  group=args.clash_group, mixed=args.proxy)
+        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=args.rotate_after)
+        if not await rotator.load_nodes():
+            logger.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
+            rotator = None
+
+    logger.info('worker %s 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
+                args.worker_id, args.proxy or '直连', args.jobs,
+                f'{len(rotator.nodes)}节点' if rotator else '关', init['stats'])
 
     bucket = TokenBucket(capacity=config.TRADES_RATE_LIMIT)
     worker_done = 0
     worker_rows = 0
     pbar = tqdm(desc=f'worker {args.worker_id}', unit='evt', dynamic_ncols=True)
 
-    async with DataAPIClient(bucket=bucket, proxy=args.proxy) as api:
+    async with DataAPIClient(
+            bucket=bucket, proxy=args.proxy,
+            on_request=rotator.on_request if rotator else None,
+            on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
 
         async def job(eid: str, attempts: int) -> None:
             """领取后的事件采集任务：成功标 done，失败按 attempts 回 pending 或死信"""

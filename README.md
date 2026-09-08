@@ -124,6 +124,38 @@ start_workers.bat
 
 参数：`--proxy`（本进程出口代理，不填=直连）、`--jobs`（同时采的事件数，默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）。
 
+### 限流自动切节点（mihomo 代理池，推荐）
+
+复用机场订阅，为每个 worker 起一个专属 mihomo(Clash.Meta) 实例（独立 mixed 端口 + 独立节点组），worker 内置节点轮换器（`clash_pool.AsyncNodeRotator`，移植自 glassdoor 项目实战经验）：
+
+- **触发**：429 累计 3 次（防抖）/ 403 / 连接级错误（死节点）→ 自动切换
+- **切换逻辑**：ban 当前节点 + 出口 IP（冷却 15 分钟）→ 轮询组内下一可用节点（切不动/出口 IP 仍在冷却的自动跳过）→ 验证新出口 IP → 暂停 5 秒等生效 → 继续采集
+- **主动轮换**：每 150 次请求主动换一个 IP（`--rotate-after`，0=仅限流时切换），摊薄单 IP 请求量
+- 切换**无需重建 HTTP 客户端**：采集连接都走实例 mixed 端口，组切换后新请求自动走新节点
+
+```powershell
+# 1. 从机场订阅生成 N 份实例配置（输出 clash_worker/w1..n.yaml + 启停脚本；需 pip install pyyaml）
+python make_worker_clash.py --n 3
+
+# 2. 一键启动（mihomo 实例 × N + worker × N，实例端口自动配对）
+start_workers.bat
+
+# 或手动：先起实例，再每个窗口一个 worker
+clash_worker\start_mihomo.bat
+python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1 --jobs 3
+python worker_activity.py --proxy http://127.0.0.1:7902 --clash-base http://127.0.0.1:9102 --worker-id w2 --jobs 3
+python worker_activity.py --proxy http://127.0.0.1:7903 --clash-base http://127.0.0.1:9103 --worker-id w3 --jobs 3
+
+# 停止实例
+clash_worker\stop_mihomo.bat
+```
+
+说明：
+- `--clash-base` 指向该 worker 专属实例的 external-controller；不配则退化为静态 `--proxy`（行为不变）
+- `clash_worker/` 含机场节点凭据，已在 .gitignore 中排除，每台机器自行生成
+- mihomo 内核默认借用快安客户端内置的 Mihomo Meta（`C:\Program Files\快安\core\KuaiAnCore.exe`），其他内核用 `--core` 指定
+- 节点池越大越好：死节点自动跳过（短冷却 5 分钟），被限流节点/出口 IP 冷却 15 分钟
+
 ### 状态监控
 
 ```sql
@@ -142,6 +174,6 @@ UPDATE activity_tasks SET status = 'pending', attempts = 0 WHERE status = 'faile
 ### 注意事项
 
 1. **不要混跑**：worker 模式与 `main_collect.py --stage activity` 单机模式使用不同进度表（`activity_tasks` vs `scrape_progress`），同时跑会重复采集（幂等不脏数据，但浪费配额）。worker 启动时会把 `scrape_progress` 中已完成的 done 断点**单向迁移**进任务队列
-2. **代理要求**：每个 worker 一个独立出口 IP 的隧道代理；多个 worker 共用同一出口 IP 无扩展效果（限流共享）
+2. **代理要求**：每个 worker 一个独立出口 IP（独立隧道代理端口，或 mihomo 代理池模式下的专属实例）；多个 worker 共用同一出口 IP 无扩展效果（限流共享）
 3. **jobs 建议 2-4**：单 IP 配额 200 req/10s，jobs 过大只是排队
 4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；强杀场景租约超时（默认 15 分钟）自动回收

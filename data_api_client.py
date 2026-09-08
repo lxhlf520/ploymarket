@@ -53,9 +53,13 @@ class DataAPIClient:
     MAX_OFFSETS = {'/trades': 10000, '/activity': 5000}
 
     def __init__(self, base_url: str = None, bucket: TokenBucket = None,
-                 proxy: str = None):
+                 proxy: str = None, on_request=None, on_rate_limited=None):
         self.base_url = base_url or config.DATA_API_BASE
         self.bucket = bucket or TokenBucket()
+        # 可选回调（async fn）：on_request 每次请求前调用（节点轮换计数/暂停等待）；
+        # on_rate_limited 遇 429/403 时调用（限流自动切节点），不影响既有重试逻辑
+        self.on_request = on_request
+        self.on_rate_limited = on_rate_limited
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(config.DATA_TIMEOUT, connect=15),
             headers=config.HEADERS,
@@ -80,9 +84,14 @@ class DataAPIClient:
         backoff = config.RETRY_BACKOFF
         for attempt in range(config.MAX_RETRIES + 1):
             await self.bucket.acquire()
+            if self.on_request:
+                await self.on_request()
             try:
                 resp = await self._client.get(f'{self.base_url}{path}', params=params)
             except httpx.HTTPError as exc:
+                # 连接级错误通常是出口节点不可用：也通知轮换器（累计达阈值自动切换）
+                if self.on_rate_limited:
+                    await self.on_rate_limited(0)
                 logger.warning('%s 请求异常(第%s次): %s', path, attempt + 1, exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
@@ -90,10 +99,16 @@ class DataAPIClient:
             if resp.status_code == 400:
                 raise RuntimeError(f'{path} 参数被拒: {resp.text[:200]}')
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                if resp.status_code == 429 and self.on_rate_limited:
+                    await self.on_rate_limited(429)
                 logger.warning('%s HTTP %s(第%s次)，退避 %.1fs', path, resp.status_code, attempt + 1, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
                 continue
+            if resp.status_code == 403:
+                # CF 按 IP 拦截：通知轮换器切节点后照常抛异常，任务回 pending 换 IP 重试
+                if self.on_rate_limited:
+                    await self.on_rate_limited(403)
             resp.raise_for_status()
             return resp.json()
         raise RuntimeError(f'{path} 重试 {config.MAX_RETRIES} 次后仍失败: {params}')
