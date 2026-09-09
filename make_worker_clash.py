@@ -18,6 +18,7 @@ mihomo 实例（独立 mixed 端口 + 独立 selector 组），worker 通过 con
 之后按 README 启动 worker：--proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101
 """
 import argparse
+import ctypes
 import os
 
 import yaml
@@ -41,6 +42,17 @@ def find_core() -> str:
         if os.path.isfile(p):
             return p
     return ''
+
+
+def short_path(p: str) -> str:
+    """转 8.3 短路径（纯 ASCII），避免 bat 中文路径编码问题；失败返回原路径"""
+    try:
+        buf = ctypes.create_unicode_buffer(300)
+        if ctypes.windll.kernel32.GetShortPathNameW(p, buf, 300):
+            return buf.value
+    except Exception:
+        pass
+    return p
 
 
 def gen_config(src: dict, mixed_port: int, ctl_port: int, secret: str) -> dict:
@@ -89,6 +101,7 @@ def main():
     if not core:
         print('警告: 未找到 mihomo 内核，请把 start_mihomo.bat 中 CORE 改为实际路径')
     else:
+        core = short_path(core)
         print(f'使用内核: {core}')
 
     out_dir = os.path.join(os.path.dirname(__file__), args.out)
@@ -118,7 +131,7 @@ def main():
         lines.append(f'start "pm-mihomo-w{i}" /min cmd /c "%CORE% -f w{i}.yaml"')
     lines += ['echo.', 'echo mihomo instances started:',
               *[f'echo   w{i}: mixed={m} controller={c}' for i, m, c in starts]]
-    with open(os.path.join(out_dir, 'start_mihomo.bat'), 'w', encoding='ascii',
+    with open(os.path.join(out_dir, 'start_mihomo.bat'), 'w', encoding='gbk',
               errors='replace') as f:
         f.write('\r\n'.join(lines) + '\r\n')
 
@@ -127,7 +140,7 @@ def main():
     stop += [f'taskkill /f /t /fi "WINDOWTITLE eq pm-mihomo-w{i}*" >nul 2>&1'
              for i, _m, _c in starts]
     stop += ['echo mihomo worker instances stopped']
-    with open(os.path.join(out_dir, 'stop_mihomo.bat'), 'w', encoding='ascii',
+    with open(os.path.join(out_dir, 'stop_mihomo.bat'), 'w', encoding='gbk',
               errors='replace') as f:
         f.write('\r\n'.join(stop) + '\r\n')
 
