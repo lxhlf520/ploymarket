@@ -170,15 +170,24 @@ async def amain(args: argparse.Namespace) -> None:
         return
 
     t0 = time.time()
+    proxy = getattr(args, 'proxy', None)
+    clash_base = getattr(args, 'clash_base', None)
+    clash_secret = getattr(args, 'clash_secret', 'pm-worker')
+    clash_group = getattr(args, 'clash_group', 'PM')
+    rotate_after = getattr(args, 'rotate_after', 150)
     if args.stage in ('markets', 'all'):
         r = await scraper_trades.scrape_market_trades(
             limit=args.limit, concurrency=args.concurrency, only=args.market,
-            refresh=not args.skip_refresh_users)
+            refresh=not args.skip_refresh_users,
+            proxy=proxy, clash_base=clash_base, clash_secret=clash_secret,
+            clash_group=clash_group, rotate_after=rotate_after)
         logger.info('Phase A 结果: %s', r)
     if args.stage in ('users', 'all'):
         r = await scraper_trades.scrape_user_activity(
             limit=args.limit, concurrency=args.concurrency,
-            refresh=not args.skip_refresh_users)
+            refresh=not args.skip_refresh_users,
+            proxy=proxy, clash_base=clash_base, clash_secret=clash_secret,
+            clash_group=clash_group, rotate_after=rotate_after)
         logger.info('Phase B 结果: %s', r)
     if args.stage in ('enrich', 'all'):
         r = await scraper_tx_enrich.enrich_pending_txs(limit=args.limit, batch_size=args.batch)
@@ -206,6 +215,15 @@ def main() -> None:
     parser.add_argument('--probe', type=int, default=10,
                         help='--dry-run 抽样探测数（0 表示不探测）')
     parser.add_argument('-v', '--verbose', action='store_true', help='DEBUG 日志')
+    # 代理 / mihomo 代理池
+    parser.add_argument('--proxy', default=None,
+                        help='HTTP 代理（如 http://127.0.0.1:7890），远程部署必传')
+    parser.add_argument('--clash-base', default=None,
+                        help='mihomo external-controller 地址（如 http://127.0.0.1:9090），启用限流自动切节点')
+    parser.add_argument('--clash-secret', default='pm-worker', help='mihomo secret')
+    parser.add_argument('--clash-group', default='PM', help='mihomo 代理组名')
+    parser.add_argument('--rotate-after', type=int, default=150,
+                        help='每 N 请求主动轮换节点（0=仅限流时切换）')
     args = parser.parse_args()
 
     setup_logging(args.verbose)

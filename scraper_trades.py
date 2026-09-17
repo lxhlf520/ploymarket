@@ -17,6 +17,7 @@ import time
 from tqdm import tqdm
 
 import config
+import clash_pool
 import db_pg
 from data_api_client import DataAPIClient, TokenBucket
 
@@ -118,7 +119,11 @@ async def _run_gathered(workers) -> None:
 
 
 async def scrape_market_trades(limit: int = None, concurrency: int = None,
-                               only: list = None, refresh: bool = True) -> dict:
+                               only: list = None, refresh: bool = True,
+                               proxy: str = None, clash_base: str = None,
+                               clash_secret: str = 'pm-worker',
+                               clash_group: str = 'PM',
+                               rotate_after: int = 150) -> dict:
     """Phase A: 全市场交易采集（--limit 试跑前 N 个；only 定向指定市场列表）"""
     await db_pg.init_schema()
     cids = load_condition_ids()
@@ -134,9 +139,13 @@ async def scrape_market_trades(limit: int = None, concurrency: int = None,
     if not todo:
         return {'markets': 0}
 
+    rotator = await _build_rotator(clash_base, clash_secret, clash_group, rotate_after, proxy)
     sem = asyncio.Semaphore(concurrency or config.TRADES_CONCURRENCY)
     stats = Stats()
-    async with DataAPIClient(bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT)) as api:
+    async with DataAPIClient(
+            bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT), proxy=proxy,
+            on_request=rotator.on_request if rotator else None,
+            on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
         with tqdm(total=len(todo), desc='markets', unit='mkt') as pbar:
             await _run_gathered([
                 _scrape_market(api, cid, sem, pbar, stats) for cid in todo
@@ -146,8 +155,26 @@ async def scrape_market_trades(limit: int = None, concurrency: int = None,
     return {'markets': len(todo), **vars(stats)}
 
 
+async def _build_rotator(clash_base, clash_secret, clash_group, rotate_after, proxy):
+    """构建 mihomo 节点轮换器（clash_base 为空返回 None）"""
+    if not clash_base:
+        return None
+    api = clash_pool.ClashAPI(base=clash_base, secret=clash_secret,
+                              group=clash_group, mixed=proxy)
+    rotator = clash_pool.AsyncNodeRotator(api, rotate_after=rotate_after)
+    if not await rotator.load_nodes():
+        logger.warning('节点轮换不可用，退化为静态代理')
+        return None
+    logger.info('clash 轮换启用: 组 %s @ %s, %d 节点', clash_group, clash_base, len(rotator.nodes))
+    return rotator
+
+
 async def scrape_user_activity(limit: int = None, concurrency: int = None,
-                               refresh: bool = True) -> dict:
+                               refresh: bool = True,
+                               proxy: str = None, clash_base: str = None,
+                               clash_secret: str = 'pm-worker',
+                               clash_group: str = 'PM',
+                               rotate_after: int = 150) -> dict:
     """Phase B: 用户活动流回补（钱包来自 PG trades 去重，可 --limit 试跑前 N 个）"""
     await db_pg.init_schema()
     wallets = await db_pg.get_pending_wallets(10_000_000)
@@ -157,9 +184,13 @@ async def scrape_user_activity(limit: int = None, concurrency: int = None,
     if not wallets:
         return {'users': 0}
 
+    rotator = await _build_rotator(clash_base, clash_secret, clash_group, rotate_after, proxy)
     sem = asyncio.Semaphore(concurrency or config.TRADES_CONCURRENCY)
     stats = Stats()
-    async with DataAPIClient(bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT)) as api:
+    async with DataAPIClient(
+            bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT), proxy=proxy,
+            on_request=rotator.on_request if rotator else None,
+            on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
         with tqdm(total=len(wallets), desc='users', unit='usr') as pbar:
             await _run_gathered([
                 _scrape_user(api, w, sem, pbar, stats) for w in wallets
@@ -170,12 +201,20 @@ async def scrape_user_activity(limit: int = None, concurrency: int = None,
 
 
 async def run_phases(market_limit: int = None, user_limit: int = None,
-                     concurrency: int = None) -> None:
+                     concurrency: int = None, proxy: str = None,
+                     clash_base: str = None, clash_secret: str = 'pm-worker',
+                     clash_group: str = 'PM', rotate_after: int = 150) -> None:
     """先市场后用户，串联执行"""
     t0 = time.time()
-    r1 = await scrape_market_trades(limit=market_limit, concurrency=concurrency)
+    r1 = await scrape_market_trades(
+        limit=market_limit, concurrency=concurrency, proxy=proxy,
+        clash_base=clash_base, clash_secret=clash_secret,
+        clash_group=clash_group, rotate_after=rotate_after)
     logger.info('Phase A 完成: %s', r1)
-    r2 = await scrape_user_activity(limit=user_limit, concurrency=concurrency)
+    r2 = await scrape_user_activity(
+        limit=user_limit, concurrency=concurrency, proxy=proxy,
+        clash_base=clash_base, clash_secret=clash_secret,
+        clash_group=clash_group, rotate_after=rotate_after)
     logger.info('Phase B 完成: %s', r2)
     logger.info('总耗时 %.1f 分钟', (time.time() - t0) / 60)
     logger.info('库汇总: %s', await db_pg.get_stats())
