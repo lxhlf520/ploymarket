@@ -175,19 +175,22 @@ async def amain(args: argparse.Namespace) -> None:
     clash_secret = getattr(args, 'clash_secret', 'pm-worker')
     clash_group = getattr(args, 'clash_group', 'PM')
     rotate_after = getattr(args, 'rotate_after', 150)
+    max_delay_ms = getattr(args, 'max_delay', 10000)
     if args.stage in ('markets', 'all'):
         r = await scraper_trades.scrape_market_trades(
             limit=args.limit, concurrency=args.concurrency, only=args.market,
             refresh=not args.skip_refresh_users,
             proxy=proxy, clash_base=clash_base, clash_secret=clash_secret,
-            clash_group=clash_group, rotate_after=rotate_after)
+            clash_group=clash_group, rotate_after=rotate_after,
+            max_delay_ms=max_delay_ms)
         logger.info('Phase A 结果: %s', r)
     if args.stage in ('users', 'all'):
         r = await scraper_trades.scrape_user_activity(
             limit=args.limit, concurrency=args.concurrency,
             refresh=not args.skip_refresh_users,
             proxy=proxy, clash_base=clash_base, clash_secret=clash_secret,
-            clash_group=clash_group, rotate_after=rotate_after)
+            clash_group=clash_group, rotate_after=rotate_after,
+            max_delay_ms=max_delay_ms)
         logger.info('Phase B 结果: %s', r)
     if args.stage in ('enrich', 'all'):
         r = await scraper_tx_enrich.enrich_pending_txs(limit=args.limit, batch_size=args.batch)
@@ -224,6 +227,8 @@ def main() -> None:
     parser.add_argument('--clash-group', default='PM', help='mihomo 代理组名')
     parser.add_argument('--rotate-after', type=int, default=150,
                         help='每 N 请求主动轮换节点（0=仅限流时切换）')
+    parser.add_argument('--max-delay', type=int, default=10000,
+                        help='节点预筛延迟上限(ms)，超过则跳过（默认 10000）')
     args = parser.parse_args()
 
     setup_logging(args.verbose)

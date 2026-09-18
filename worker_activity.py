@@ -67,6 +67,8 @@ def parse_args():
                         help='mihomo selector 组名（默认 PM）')
     parser.add_argument('--rotate-after', type=int, default=150,
                         help='每 N 次请求主动轮换节点（默认 150；0=仅限流时切换）')
+    parser.add_argument('--max-delay', type=int, default=10000,
+                        help='节点预筛延迟上限(ms)，超过则跳过（默认 10000）')
     return parser.parse_args()
 
 
@@ -79,7 +81,8 @@ async def amain(args):
     if args.clash_base:
         api = clash_pool.ClashAPI(base=args.clash_base, secret=args.clash_secret,
                                   group=args.clash_group, mixed=args.proxy)
-        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=args.rotate_after)
+        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=args.rotate_after,
+                                               max_delay_ms=args.max_delay)
         if not await rotator.load_nodes():
             logger.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
             rotator = None
