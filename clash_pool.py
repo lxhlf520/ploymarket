@@ -84,11 +84,12 @@ class ClashAPI:
             return None
 
     async def delay(self, node: str, timeout_ms: int = 5000) -> int | None:
-        """测试节点延迟（ms），失败返回 None。走 controller /delay 端点，不切节点"""
+        """测试节点延迟（ms），失败返回 None。走 controller /delay 端点，不切节点。
+        测试 URL 用 Polymarket data-api（实际目标站），比 gstatic 更准确。"""
         url = f'/proxies/{urllib.parse.quote(node, safe="")}/delay'
         try:
             resp = await self._ctl.get(url, params={
-                'url': 'http://www.gstatic.com/generate_204',
+                'url': 'https://data-api.polymarket.com/time',
                 'timeout': timeout_ms,
             }, timeout=timeout_ms / 1000 + 3)
             if resp.status_code == 200:
