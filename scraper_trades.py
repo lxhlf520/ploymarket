@@ -165,6 +165,7 @@ async def _build_rotator(clash_base, clash_secret, clash_group, rotate_after, pr
     if not await rotator.load_nodes():
         logger.warning('节点轮换不可用，退化为静态代理')
         return None
+    await rotator.start_health_check()
     logger.info('clash 轮换启用: 组 %s @ %s, %d 节点', clash_group, clash_base, len(rotator.nodes))
     return rotator
 

@@ -83,6 +83,35 @@ class ClashAPI:
         except Exception:
             return None
 
+    async def delay(self, node: str, timeout_ms: int = 5000) -> int | None:
+        """测试节点延迟（ms），失败返回 None。走 controller /delay 端点，不切节点"""
+        url = f'/proxies/{urllib.parse.quote(node, safe="")}/delay'
+        try:
+            resp = await self._ctl.get(url, params={
+                'url': 'http://www.gstatic.com/generate_204',
+                'timeout': timeout_ms,
+            }, timeout=timeout_ms / 1000 + 3)
+            if resp.status_code == 200:
+                return resp.json().get('delay')
+        except Exception:
+            pass
+        return None
+
+    async def batch_delay(self, nodes: list, timeout_ms: int = 5000,
+                          concurrency: int = 20) -> dict:
+        """并发批量测延迟，返回 {node: delay_ms}（仅含成功的）"""
+        sem = asyncio.Semaphore(concurrency)
+        results = {}
+
+        async def _one(n):
+            async with sem:
+                d = await self.delay(n, timeout_ms)
+                if d is not None:
+                    results[n] = d
+
+        await asyncio.gather(*[_one(n) for n in nodes])
+        return results
+
     async def switch_and_wait(self, node: str, settle: float = 1.0):
         """切换节点并等其生效，返回新出口 (ip, desc)；切换失败或探测失败返回 None"""
         if not await self.switch(node):
@@ -103,12 +132,16 @@ class AsyncNodeRotator:
 
     def __init__(self, api: ClashAPI, rotate_after: int = 150,
                  ban_cooldown: float = 900, switch_pause: float = 5.0,
-                 node_cooldown: float = 300):
+                 node_cooldown: float = 300,
+                 max_delay_ms: int = 3000,
+                 health_interval: float = 600):
         self.api = api
         self.rotate_after = rotate_after
         self.ban_cooldown = ban_cooldown
         self.switch_pause = switch_pause
         self.node_cooldown = node_cooldown
+        self.max_delay_ms = max_delay_ms
+        self.health_interval = health_interval
         self.lock = asyncio.Lock()
         self.nodes: list = []
         self.idx = -1
@@ -120,32 +153,120 @@ class AsyncNodeRotator:
         self.pending_429 = 0
         self.pause_until = 0.0
         self.enabled = False
+        self._health_task: asyncio.Task | None = None
+        self._node_delays: dict = {}  # {node: last_delay_ms}
 
     async def load_nodes(self) -> bool:
-        """启动时拉取 selector 组节点列表；成功后 rotator 生效"""
+        """启动时拉取 selector 组节点列表 → 并发预筛延迟 → 按延迟排序；成功后 rotator 生效"""
         if not await self.api.alive():
             logger.warning('clash controller 不可用: %s', self.api.base)
             return False
         try:
-            nodes = await self.api.nodes()
+            all_nodes = await self.api.nodes()
         except Exception as exc:
             logger.warning('拉取节点列表失败: %s', exc)
             return False
-        if not nodes:
+        if not all_nodes:
             logger.warning('selector 组 %s 无可用节点', self.api.group)
             return False
-        random.shuffle(nodes)
-        self.nodes = nodes
+        # ── 并发预筛：批量测延迟，只保留延迟 < max_delay_ms 的节点 ──
+        logger.info('预筛 %d 个节点（延迟上限 %d ms）...', len(all_nodes), self.max_delay_ms)
+        delays = await self.api.batch_delay(all_nodes, timeout_ms=self.max_delay_ms)
+        # 按延迟升序排列（快的优先）
+        good = sorted(delays, key=lambda n: delays[n])
+        skipped = len(all_nodes) - len(good)
+        if skipped:
+            logger.info('预筛结果: %d 可用, %d 超时/不可达（已跳过）', len(good), skipped)
+        if not good:
+            logger.warning('预筛后无可用节点！全部超时或不可达')
+            return False
+        random.shuffle(good)  # 同延迟档位内随机，避免总是先打最快那几个
+        self.nodes = good
+        self._node_delays = delays
         try:
             self.current = await self.api.current()
         except Exception:
             self.current = None
-        if self.current in nodes:
-            self.idx = nodes.index(self.current)
+        if self.current in self.nodes:
+            self.idx = self.nodes.index(self.current)
         self.enabled = True
-        logger.info('clash 轮换启用: 组 %s @ %s, %s 个节点, 当前 %s',
-                    self.api.group, self.api.base, len(nodes), self.current)
+        logger.info('clash 轮换启用: 组 %s @ %s, %d/%d 节点通过预筛, 当前 %s',
+                    self.api.group, self.api.base, len(good), len(all_nodes), self.current)
+        if good:
+            top5 = good[:5]
+            logger.info('延迟最低 5 节点: %s',
+                        ', '.join(f'{n}({delays[n]}ms)' for n in top5))
         return True
+
+    async def start_health_check(self):
+        """启动后台周期性健康检查（每 health_interval 秒重测一次延迟）"""
+        if self._health_task is None or self._health_task.done():
+            self._health_task = asyncio.create_task(self._health_loop())
+
+    async def stop_health_check(self):
+        if self._health_task and not self._health_task.done():
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _health_loop(self):
+        """后台循环：定期重测所有节点延迟，剔除变差节点，发现恢复节点"""
+        while self.enabled:
+            await asyncio.sleep(self.health_interval)
+            try:
+                await self._do_health_check()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning('健康检查异常: %s', exc)
+
+    async def _do_health_check(self):
+        """单次健康检查：重测延迟 → 更新节点池"""
+        all_nodes = await self.api.nodes()
+        if not all_nodes:
+            return
+        delays = await self.api.batch_delay(all_nodes, timeout_ms=self.max_delay_ms)
+        good_set = set(delays)
+        old_nodes = set(self.nodes)
+        # 新增的可达节点（之前不可达，现在恢复了）
+        new_good = good_set - old_nodes
+        # 变差的节点（之前可达，现在超时了）
+        gone_bad = old_nodes - good_set
+        async with self.lock:
+            now = time.time()
+            # 剔除变差节点（如果在冷却中则不重复 ban）
+            for n in gone_bad:
+                if n not in self.banned_nodes or self.banned_nodes[n] < now:
+                    self.banned_nodes[n] = now + self.node_cooldown
+            # 恢复节点加入池
+            for n in new_good:
+                self.banned_nodes.pop(n, None)
+                if n not in self.nodes:
+                    self.nodes.append(n)
+            # 重建节点列表：保留仍在 good_set 中的，按延迟排序
+            alive_nodes = [n for n in self.nodes if n in good_set]
+            # 加上新恢复的
+            for n in new_good:
+                if n not in alive_nodes:
+                    alive_nodes.append(n)
+            if alive_nodes:
+                random.shuffle(alive_nodes)
+                self.nodes = alive_nodes
+                # 修正 idx
+                if self.current in self.nodes:
+                    self.idx = self.nodes.index(self.current)
+                else:
+                    self.idx = -1
+            self._node_delays = delays
+        if gone_bad:
+            logger.info('健康检查: %d 节点变差已剔除: %s',
+                        len(gone_bad), ', '.join(gone_bad))
+        if new_good:
+            logger.info('健康检查: %d 节点恢复: %s',
+                        len(new_good), ', '.join(new_good))
+        logger.info('健康检查完成: %d/%d 节点可用', len(self.nodes), len(all_nodes))
 
     async def on_request(self):
         """每次 API 请求前回调：切换后暂停期等待 + 主动轮换计数"""

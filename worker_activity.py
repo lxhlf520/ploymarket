@@ -83,6 +83,8 @@ async def amain(args):
         if not await rotator.load_nodes():
             logger.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
             rotator = None
+        else:
+            await rotator.start_health_check()
 
     logger.info('worker %s 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
                 args.worker_id, args.proxy or '直连', args.jobs,
