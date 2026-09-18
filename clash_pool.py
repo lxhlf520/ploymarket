@@ -319,6 +319,13 @@ class AsyncNodeRotator:
     async def _rotate_locked(self, reason: str):
         """轮询选下一个可用节点（调用方须已持锁）"""
         now = time.time()
+        # 清理已过期的 ban 记录，防止字典无限膨胀
+        expired_nodes = [k for k, v in self.banned_nodes.items() if v <= now]
+        for k in expired_nodes:
+            del self.banned_nodes[k]
+        expired_ips = [k for k, v in self.banned_ips.items() if v <= now]
+        for k in expired_ips:
+            del self.banned_ips[k]
         n = len(self.nodes)
         for _ in range(n):
             self.idx = (self.idx + 1) % n
@@ -342,7 +349,9 @@ class AsyncNodeRotator:
             self.last_rotate = time.time()
             self.pause_until = time.time() + self.switch_pause
             return
-        # 全部节点冷却中：全局暂停到最早解禁
-        wake = min(list(self.banned_nodes.values()) + [time.time() + 120])
+        # 全部节点冷却中：全局暂停到最晚解禁（只考虑尚未过期的 ban）
+        now = time.time()
+        active_bans = [t for t in self.banned_nodes.values() if t > now]
+        wake = min(active_bans) if active_bans else now + 120
         self.pause_until = wake + self.switch_pause
-        logger.warning('所有节点冷却中，%.0f 秒后重试', self.pause_until - time.time())
+        logger.warning('所有节点冷却中，%.0f 秒后重试', self.pause_until - now)
