@@ -45,7 +45,10 @@ def find_core() -> str:
 
 
 def short_path(p: str) -> str:
-    """转 8.3 短路径（纯 ASCII），避免 bat 中文路径编码问题；失败返回原路径"""
+    """转 8.3 短路径（纯 ASCII），避免 bat 中文路径编码问题；纯 ASCII 路径直接返回；失败返回原路径"""
+    # 纯 ASCII 路径不需要转换（避免 GetShortPathNameW 同名文件映射错误）
+    if p.isascii():
+        return p
     try:
         buf = ctypes.create_unicode_buffer(300)
         if ctypes.windll.kernel32.GetShortPathNameW(p, buf, 300):
