@@ -17,3 +17,8 @@ cookies.json
 
 # worker 专用 mihomo 配置（含机场节点凭据 uuid，严禁入库；由 make_worker_clash.py 生成）
 clash_worker/
+
+# mihomo 内核二进制/压缩包（体积大，本地部署用，严禁入库）
+mihomo.zip
+mihomo_core/
+mihomo-windows-amd64.exe
