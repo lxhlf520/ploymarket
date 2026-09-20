@@ -20,6 +20,90 @@ def _load_env(path: str) -> None:
 
 _load_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
+
+def _parse_proxy_server(server: str) -> str:
+    """解析注册表 ProxyServer 字段为 http:// 代理 URL。
+
+    支持两种格式：
+    - 统一:   "127.0.0.1:7890"
+    - 分协议: "http=127.0.0.1:7890;https=127.0.0.1:7890;socks=..."
+    """
+    server = (server or '').strip()
+    if not server:
+        return ''
+    if '=' in server:
+        parts = dict(kv.split('=', 1) for kv in server.split(';') if '=' in kv)
+        addr = (parts.get('https') or parts.get('http') or '').strip()
+    else:
+        addr = server
+    if not addr:
+        return ''
+    if not addr.startswith('http://') and not addr.startswith('https://'):
+        addr = 'http://' + addr
+    return addr
+
+
+def apply_system_proxy() -> str:
+    """自动跟随本机系统代理（“本机网络做那个就是那个”）。
+
+    httpx 的 trust_env 只读环境变量、不读 Windows 注册表系统代理，
+    这里把注册表里的系统代理回填到 HTTP(S)_PROXY 环境变量，
+    使所有 httpx 客户端（data_api/gamma/clob/tx_enrich）自动走本机代理。
+
+    规则：
+    - 非 Windows 直接返回（交由环境变量/直连）
+    - 已显式设置 HTTP(S)_PROXY 环境变量则尊重，不覆盖
+    - 系统代理关闭（或用 TUN 模式）时不设置，保持直连（TUN 在网络层接管）
+    - 显式传 --proxy 的 mihomo worker 不受影响（httpx 中显式代理优先于环境变量）
+    返回最终生效的代理 URL（无则空串）。
+    """
+    # 已显式设置代理环境变量：尊重现有配置
+    existing = (os.environ.get('HTTPS_PROXY') or os.environ.get('https_proxy')
+                or os.environ.get('HTTP_PROXY') or os.environ.get('http_proxy')
+                or os.environ.get('ALL_PROXY') or os.environ.get('all_proxy'))
+    if existing:
+        return existing
+    if os.name != 'nt':
+        return ''
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r'Software\Microsoft\Windows\CurrentVersion\Internet Settings')
+        try:
+            enable, _ = winreg.QueryValueEx(key, 'ProxyEnable')
+            if not enable:
+                return ''
+            server, _ = winreg.QueryValueEx(key, 'ProxyServer')
+            try:
+                override, _ = winreg.QueryValueEx(key, 'ProxyOverride')
+            except OSError:
+                override = ''
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return ''
+    proxy_url = _parse_proxy_server(server)
+    if not proxy_url:
+        return ''
+    os.environ['HTTP_PROXY'] = proxy_url
+    os.environ['HTTPS_PROXY'] = proxy_url
+    # 本地回环不走代理（mihomo controller/mixed 等 127.0.0.1 端点必须直连）
+    no_proxy = 'localhost,127.0.0.1'
+    if override:
+        # 注册表 ProxyOverride 用 ; 分隔，<local> 表示本地地址
+        extra = ','.join(o.strip() for o in override.split(';')
+                         if o.strip() and o.strip() != '<local>')
+        if extra:
+            no_proxy += ',' + extra
+    os.environ['NO_PROXY'] = no_proxy
+    os.environ['no_proxy'] = no_proxy
+    return proxy_url
+
+
+# 模块加载时自动应用（早于任何 httpx 客户端创建）
+SYSTEM_PROXY = apply_system_proxy()
+
 # ==================== 原有配置（Gamma API / SQLite 事件市场评论采集） ====================
 
 GAMMA_API_BASE = 'https://gamma-api.polymarket.com'

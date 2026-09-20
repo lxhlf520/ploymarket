@@ -90,7 +90,9 @@ async def amain(args):
             await rotator.start_health_check()
 
     logger.info('worker %s 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
-                args.worker_id, args.proxy or '直连', args.jobs,
+                args.worker_id,
+                args.proxy or (f'系统代理 {config.SYSTEM_PROXY}' if config.SYSTEM_PROXY else '直连'),
+                args.jobs,
                 f'{len(rotator.nodes)}节点' if rotator else '关', init['stats'])
 
     bucket = TokenBucket(capacity=config.TRADES_RATE_LIMIT)

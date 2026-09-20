@@ -171,6 +171,12 @@ async def amain(args: argparse.Namespace) -> None:
 
     t0 = time.time()
     proxy = getattr(args, 'proxy', None)
+    if proxy:
+        logger.info('代理: 显式指定 %s', proxy)
+    elif config.SYSTEM_PROXY:
+        logger.info('代理: 自动跟随本机系统代理 %s', config.SYSTEM_PROXY)
+    else:
+        logger.info('代理: 无（直连）')
     clash_base = getattr(args, 'clash_base', None)
     clash_secret = getattr(args, 'clash_secret', 'pm-worker')
     clash_group = getattr(args, 'clash_group', 'PM')
