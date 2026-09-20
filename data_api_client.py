@@ -82,6 +82,7 @@ class DataAPIClient:
     async def _get_page(self, path: str, params: dict) -> list:
         """带限流与退避重试的单页 GET，返回 JSON 列表"""
         backoff = config.RETRY_BACKOFF
+        last_err = '未知'   # 记录最后一次失败根因，重试耗尽后带入异常方便定位
         for attempt in range(config.MAX_RETRIES + 1):
             await self.bucket.acquire()
             if self.on_request:
@@ -90,6 +91,7 @@ class DataAPIClient:
                 resp = await self._client.get(f'{self.base_url}{path}', params=params)
             except httpx.HTTPError as exc:
                 # 连接级错误通常是出口节点不可用：也通知轮换器（累计达阈值自动切换）
+                last_err = f'{type(exc).__name__}: {str(exc)[:150]}'
                 if self.on_rate_limited:
                     await self.on_rate_limited(0)
                 logger.warning('%s 请求异常(第%s次): %s', path, attempt + 1, exc)
@@ -99,6 +101,7 @@ class DataAPIClient:
             if resp.status_code == 400:
                 raise RuntimeError(f'{path} 参数被拒: {resp.text[:200]}')
             if resp.status_code == 429 or 500 <= resp.status_code < 600:
+                last_err = f'HTTP {resp.status_code}'
                 if resp.status_code == 429 and self.on_rate_limited:
                     await self.on_rate_limited(429)
                 logger.warning('%s HTTP %s(第%s次)，退避 %.1fs', path, resp.status_code, attempt + 1, backoff)
@@ -106,12 +109,15 @@ class DataAPIClient:
                 backoff = min(backoff * 2, 30)
                 continue
             if resp.status_code == 403:
-                # CF 按 IP 拦截：通知轮换器切节点后照常抛异常，任务回 pending 换 IP 重试
+                # CF 按 IP 拦截：打印响应体片段（CF 挑战页有特征），通知轮换器后抛异常
+                last_err = f'HTTP 403 body[:150]={resp.text[:150]!r}'
+                logger.error('%s HTTP 403 (CF封禁/挑战) url=%s body[:150]=%s',
+                             path, resp.request.url, resp.text[:150])
                 if self.on_rate_limited:
                     await self.on_rate_limited(403)
             resp.raise_for_status()
             return resp.json()
-        raise RuntimeError(f'{path} 重试 {config.MAX_RETRIES} 次后仍失败: {params}')
+        raise RuntimeError(f'{path} 重试 {config.MAX_RETRIES} 次后仍失败 [{last_err}]: {params}')
 
     async def fetch_all(self, path: str, base_params: dict, page_size: int,
                         on_batch=None) -> int:

@@ -86,7 +86,7 @@ async def _scrape_market(api: DataAPIClient, condition_id: str, sem: asyncio.Sem
             await db_pg.mark_scope_done(f'market:{condition_id}', total)
         except Exception as exc:
             stats.failures += 1
-            logger.warning('市场 %s 采集失败: %s', condition_id, exc)
+            logger.error('市场 %s 采集失败 [%s]: %s', condition_id, type(exc).__name__, exc)
         finally:
             pbar.update(1)
             pbar.set_postfix(inserted=stats.inserted, updated=stats.updated, failed=stats.failures)
@@ -106,7 +106,7 @@ async def _scrape_user(api: DataAPIClient, wallet: str, sem: asyncio.Semaphore,
             await db_pg.mark_scope_done(f'user:{wallet}', total)
         except Exception as exc:
             stats.failures += 1
-            logger.warning('用户 %s 采集失败: %s', wallet, exc)
+            logger.error('用户 %s 采集失败 [%s]: %s', wallet, type(exc).__name__, exc)
         finally:
             pbar.update(1)
             pbar.set_postfix(inserted=stats.inserted, updated=stats.updated, failed=stats.failures)
