@@ -92,6 +92,46 @@ async def _scrape_market(api: DataAPIClient, condition_id: str, sem: asyncio.Sem
             pbar.set_postfix(inserted=stats.inserted, updated=stats.updated, failed=stats.failures)
 
 
+async def _scrape_market_group(api: DataAPIClient, cids: list, sem: asyncio.Semaphore,
+                               pbar: tqdm, stats: Stats) -> None:
+    """v2 批量组采集（≤TRADES_BATCH_SIZE 个市场共享 cursor 翻页）。
+
+    组结束后按行内 conditionId 分桶逐市场标记进度；
+    整组异常时降级为逐市场重拉（隔离毒丸市场，已入行幂等可重）。
+    """
+    async with sem:
+        batch = []
+
+        async def on_batch(page):
+            await _batch_upsert(page, batch, stats)
+
+        try:
+            counts = await api.fetch_trades_batch(cids, on_batch=on_batch)
+            await _flush_batch(batch, stats)
+            for cid in cids:
+                await db_pg.mark_scope_done(f'market:{cid}', counts.get(cid, 0))
+        except Exception as exc:
+            logger.warning('批量组(%s 市场)失败，降级逐市场: [%s] %s',
+                           len(cids), type(exc).__name__, exc)
+            await _flush_batch(batch, stats)
+            for cid in cids:
+                sub = []
+
+                async def on_sub(page):
+                    await _batch_upsert(page, sub, stats)
+
+                try:
+                    total = await api.fetch_market_trades(cid, on_batch=on_sub)
+                    await _flush_batch(sub, stats)
+                    await db_pg.mark_scope_done(f'market:{cid}', total)
+                except Exception as exc2:
+                    stats.failures += 1
+                    logger.error('市场 %s 采集失败 [%s]: %s', cid, type(exc2).__name__, exc2)
+        finally:
+            pbar.update(len(cids))
+            pbar.set_postfix(inserted=stats.inserted, updated=stats.updated, failed=stats.failures)
+
+
 async def _scrape_user(api: DataAPIClient, wallet: str, sem: asyncio.Semaphore,
                        pbar: tqdm, stats: Stats) -> None:
     async with sem:
@@ -148,9 +188,18 @@ async def scrape_market_trades(limit: int = None, concurrency: int = None,
             on_request=rotator.on_request if rotator else None,
             on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
         with tqdm(total=len(todo), desc='markets', unit='mkt') as pbar:
-            await _run_gathered([
-                _scrape_market(api, cid, sem, pbar, stats) for cid in todo
-            ])
+            if config.DATA_API_V2:
+                step = config.TRADES_BATCH_SIZE
+                groups = [todo[i:i + step] for i in range(0, len(todo), step)]
+                logger.info('Phase A 批量模式: %s 组（每组 ≤%s 市场，v2 cursor 翻页）',
+                            len(groups), step)
+                await _run_gathered([
+                    _scrape_market_group(api, g, sem, pbar, stats) for g in groups
+                ])
+            else:
+                await _run_gathered([
+                    _scrape_market(api, cid, sem, pbar, stats) for cid in todo
+                ])
     if refresh:
         await db_pg.refresh_users()
     return {'markets': len(todo), **vars(stats)}

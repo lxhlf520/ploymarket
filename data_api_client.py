@@ -2,11 +2,16 @@
 # -*- coding: utf-8 -*-
 """Data API 客户端 - 交易与活动流采集（data-api.polymarket.com）
 
-实测接口约束（以此为准）：
-- /trades:   limit<=10000, offset<=10000, 支持 market/user/end 过滤
-- /activity: limit<=500,   offset<=5000,  支持 user/end 过滤（含 usdcSize、type）
-- 两接口默认按时间戳倒序；offset 超出上限返回 400
-- 深翻页策略：end 时间窗口 + 窗口内 offset，边界时间戳行数超过上限时前移 end
+v1 于 2026-10-24 退役，当前默认走 v2（设 DATA_API_V2=0 临时回退 v1）：
+- v2: /v2/trades（condition/event_id 批量 ≤20）、/v2/activity（user 锚定）、
+      /v2/holders、/v2/positions；cursor 翻页（opaque，翻页请求必须重复携带
+      过滤参数）；snake_case 行 + {data, pagination} envelope
+- v1: /trades（market/eventId）、/activity、/holders、/v1/market-positions；
+      end 窗口 + offset 翻页，行字段 camelCase，offset 超上限 400
+
+v2 口径实测：默认参数（taker_only=true、filter_type=TOKENS、filter_amount=0.01）
+与 v1 逐行一致（行键 overlap 100%）；单页上限 trades/activity 均 1000。
+行统一归一化为 v1 风格 camelCase（token_id → asset），下游零改动。
 
 限流：Cloudflare 先减速后 429（无 Retry-After），慢响应视为成功不重试；
 Data API /trades+/activity 共享预算 200 次/10 秒，用全局令牌桶对齐。
@@ -21,6 +26,33 @@ import httpx
 import config
 
 logger = logging.getLogger(__name__)
+
+# v2 行字段映射（snake_case → camelCase，与 v1 行对齐，下游 db_pg 零改动）
+# 特例：trades/activity 行的 token_id ↔ v1 asset；holders/positions 保持 token_id
+V2_FIELD_MAP = {
+    'transaction_hash': 'transactionHash',
+    'condition_id': 'conditionId',
+    'proxy_wallet': 'proxyWallet',
+    'outcome_index': 'outcomeIndex',
+    'profile_image': 'profileImage',
+    'profile_image_optimized': 'profileImageOptimized',
+    'event_slug': 'eventSlug',
+    'usdc_size': 'usdcSize',
+}
+
+
+def norm_v2_row(row: dict, token_as_asset: bool = False) -> dict:
+    """v2 行归一化：snake_case → camelCase（保持与 v1 行结构一致）。
+
+    token_as_asset: trades/activity 行的 token_id 对应 v1 asset 字段时置 True。
+    """
+    out = {}
+    for k, v in row.items():
+        if k == 'token_id':
+            out['asset' if token_as_asset else 'token_id'] = v
+        else:
+            out[V2_FIELD_MAP.get(k, k)] = v
+    return out
 
 
 class TokenBucket:
@@ -163,26 +195,91 @@ class DataAPIClient:
                 guard = 0
         return total
 
+    async def fetch_all_v2(self, path: str, base_params: dict, page_size: int,
+                           on_batch=None, max_pages: int = 50000) -> int:
+        """v2 cursor 翻页全量拉取（envelope: {data, pagination}），返回总行数。
+
+        关键约束（实测）：cursor 仅承载 keyset 位置，不承载过滤条件——
+        翻页请求必须重复携带原始过滤参数（condition/user/...），否则退化为全局 feed。
+        on_batch: 可选回调 async fn(list[dict])，行已做 snake_case→camelCase 归一化。
+        """
+        total = 0
+        cursor = None
+        pages = 0
+        while pages < max_pages:
+            params = dict(base_params)
+            params['limit'] = page_size
+            if cursor:
+                params['cursor'] = cursor
+            env = await self._get_page(path, params)
+            data = (env or {}).get('data') or []
+            if data:
+                rows = [norm_v2_row(r, token_as_asset=True) for r in data]
+                total += len(rows)
+                if on_batch is not None:
+                    await on_batch(rows)
+            pages += 1
+            pag = (env or {}).get('pagination') or {}
+            nxt = pag.get('next_cursor')
+            # next_cursor 与上一页相同视为死循环保护
+            if not pag.get('has_more') or not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return total
+
+    async def fetch_trades_batch(self, condition_ids: list, on_batch=None,
+                                 page_size: int = None) -> dict:
+        """v2 批量拉取一组市场（≤TRADES_BATCH_SIZE 个）全部交易，返回 {cid: 行数}。
+
+        批量上限 20 个 distinct condition；响应行按行内 conditionId 分桶统计。
+        仅 v2 支持；调用方负责把失败组降级为逐市场重试。
+        """
+        cids = [c for c in dict.fromkeys(condition_ids) if c]
+        if not cids or len(cids) > config.TRADES_BATCH_SIZE:
+            raise ValueError(f'批量 condition 数量非法: {len(cids)}')
+        counts = {c: 0 for c in cids}
+
+        async def _wrap(rows):
+            for r in rows:
+                cid = r.get('conditionId')
+                if cid in counts:
+                    counts[cid] += 1
+            if on_batch:
+                await on_batch(rows)
+
+        await self.fetch_all_v2('/v2/trades', {'condition': ','.join(cids)},
+                                page_size or config.TRADES_PAGE_SIZE, on_batch=_wrap)
+        return counts
+
     async def fetch_market_trades(self, condition_id: str, on_batch=None) -> int:
-        """拉取单个市场全部历史交易"""
+        """拉取单个市场全部历史交易（v2 cursor / v1 end 窗口）"""
+        if config.DATA_API_V2:
+            return await self.fetch_all_v2(
+                '/v2/trades', {'condition': condition_id},
+                config.TRADES_PAGE_SIZE, on_batch=on_batch)
         return await self.fetch_all(
             '/trades', {'market': condition_id},
-            config.TRADES_PAGE_SIZE, on_batch=on_batch,
-        )
+            config.TRADES_PAGE_SIZE, on_batch=on_batch)
 
     async def fetch_user_activity(self, wallet: str, on_batch=None) -> int:
         """拉取单个用户全部活动流（含 TRADE/REDEEM/MERGE/SPLIT/REWARD/CONVERSION）"""
+        if config.DATA_API_V2:
+            return await self.fetch_all_v2(
+                '/v2/activity', {'user': wallet},
+                config.ACTIVITY_PAGE_SIZE, on_batch=on_batch)
         return await self.fetch_all(
             '/activity', {'user': wallet},
-            config.ACTIVITY_PAGE_SIZE, on_batch=on_batch,
-        )
+            config.ACTIVITY_PAGE_SIZE, on_batch=on_batch)
 
     async def fetch_holders(self, market: str, on_batch=None) -> int:
         """拉取单个市场全部 Top Holders。
 
-        实测响应为列表 [{token, holders: [...]}]（按 token 分组），
+        v2 响应 {data: [{token_id, holders: [...]}]}（cursor 翻页）；
+        v1 响应 [{token, holders: [...]}]（offset 翻页）。
         展平为每行带 token_id 的 holder 记录后回调 on_batch。
         """
+        if config.DATA_API_V2:
+            return await self._fetch_holders_v2(market, on_batch)
         offset = 0
         total = 0
         guard = 0
@@ -209,12 +306,43 @@ class DataAPIClient:
             offset += config.HOLDERS_PAGE_SIZE
         return total
 
+    async def _fetch_holders_v2(self, market: str, on_batch=None) -> int:
+        """v2 /v2/holders（condition 错定，cursor 翻页，分组结构与 v1 一致）"""
+        total = 0
+        cursor = None
+        guard = 0
+        while guard < 2000:
+            params = {'condition': market, 'limit': config.HOLDERS_PAGE_SIZE}
+            if cursor:
+                params['cursor'] = cursor
+            env = await self._get_page('/v2/holders', params)
+            data = (env or {}).get('data') or []
+            rows = []
+            for group in data:
+                tid = group.get('token_id') or group.get('token')
+                for h in group.get('holders') or []:
+                    h = norm_v2_row(h)
+                    h['token_id'] = tid
+                    rows.append(h)
+            if on_batch and rows:
+                await on_batch(rows)
+            total += len(rows)
+            guard += 1
+            pag = (env or {}).get('pagination') or {}
+            nxt = pag.get('next_cursor')
+            if not pag.get('has_more') or not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return total
+
     async def fetch_market_positions(self, market: str, on_batch=None) -> int:
-        """拉取单个市场持仓快照（每 token 组 Top limit 条，offset 实测无效无法翻页）。
-    
-        实测响应 [{token, positions: [...]}]（按 token 分组），offset 参数被忽略
-        （多次请求返回相同数据），故只拉 1 页即可，展平后补 condition_id/token_id。
+        """拉取单个市场持仓快照（每 token 组 Top limit 条）。
+
+        v2: /v2/positions（扁平行 + cursor 翻页，默认 status=OPEN）；
+        v1: /v1/market-positions（[{token, positions: [...]}] 分组，offset 实测无效只拉 1 页）。
         """
+        if config.DATA_API_V2:
+            return await self._fetch_positions_v2(market, on_batch)
         data = await self._get_page('/v1/market-positions', {
             'market': market,
             'limit': config.POSITIONS_PAGE_SIZE,
@@ -237,11 +365,45 @@ class DataAPIClient:
             await on_batch(rows)
         return len(rows)
 
+    async def _fetch_positions_v2(self, market: str, on_batch=None) -> int:
+        """v2 /v2/positions（condition 错定，cursor 翻页，扁平行）。
+
+        字段归一化：current_size→size、current_price→curr_price（对齐 v1/db 字段名）；
+        cash_pnl / total_bought 在 v2 无对应字段（保持留空）。
+        """
+        total = 0
+        cursor = None
+        guard = 0
+        while guard < 2000:
+            params = {'condition': market, 'limit': config.POSITIONS_PAGE_SIZE}
+            if cursor:
+                params['cursor'] = cursor
+            env = await self._get_page('/v2/positions', params)
+            data = (env or {}).get('data') or []
+            rows = []
+            for pos in data:
+                pos = norm_v2_row(pos)
+                pos.setdefault('size', pos.get('current_size'))
+                pos.setdefault('curr_price', pos.get('current_price'))
+                if not pos.get('condition_id'):
+                    pos['condition_id'] = market
+                rows.append(pos)
+            if on_batch and rows:
+                await on_batch(rows)
+            total += len(rows)
+            guard += 1
+            pag = (env or {}).get('pagination') or {}
+            nxt = pag.get('next_cursor')
+            if not pag.get('has_more') or not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return total
+
     async def fetch_event_trades(self, event_id, on_batch=None) -> int:
         """拉取单个事件全部 CASH 交易（Activity 维度）。
 
-        实测 /trades?eventId= 响应行无 eventId 字段（仅 eventSlug），
-        入库前统一补充 eventId。沿用 end 窗口翻页突破 offset 上限。
+        v1 /trades?eventId= 与 v2 /v2/trades?event_id=&filter_type=CASH。
+        实测响应行无 eventId 字段（仅 eventSlug），入库前统一补充 eventId。
         """
         async def _wrap(page):
             for r in page:
@@ -250,11 +412,18 @@ class DataAPIClient:
             if on_batch:
                 await on_batch(page)
 
+        if config.DATA_API_V2:
+            return await self.fetch_all_v2(
+                '/v2/trades', {'event_id': str(event_id), 'filter_type': 'CASH'},
+                config.TRADES_PAGE_SIZE, on_batch=_wrap)
         return await self.fetch_all(
             '/trades', {'eventId': event_id, 'filterType': 'CASH'},
             config.TRADES_PAGE_SIZE, on_batch=_wrap,
         )
 
     async def probe_page(self, path: str, params: dict) -> list:
-        """拉取单个页面（--dry-run 估算用），返回行列表"""
-        return await self._get_page(path, params)
+        """拉取单个页面（--dry-run 估算用），返回行列表（v2 envelope 自动解包）"""
+        data = await self._get_page(path, params)
+        if isinstance(data, dict):
+            data = data.get('data') or []
+        return data

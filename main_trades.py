@@ -83,6 +83,38 @@ async def dry_run_markets(probe: int) -> dict:
     n = len(todo)
     if n == 0:
         return {'待采集市场': 0, '预估请求数': 0}
+    if config.DATA_API_V2:
+        # v2 批量模式：每组 ≤TRADES_BATCH_SIZE 市场共享 cursor 翻页
+        step = config.TRADES_BATCH_SIZE
+        groups = [todo[i:i + step] for i in range(0, len(todo), step)]
+        avg_pages = 1.0
+        probed = 0
+        if probe > 0:
+            sample = groups[:max(1, probe // step)]
+            async with DataAPIClient(bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT)) as api:
+                pages = 0
+                for g in sample:
+                    try:
+                        page = await api.probe_page('/v2/trades', {
+                            'condition': ','.join(g),
+                            'limit': config.TRADES_PAGE_SIZE,
+                        })
+                    except Exception as exc:
+                        logger.warning('探测批量组失败: %s', exc)
+                        continue
+                    probed += 1
+                    pages += 1 + (1 if len(page) >= config.TRADES_PAGE_SIZE else 0)
+                avg_pages = (pages / probed) if probed else 1.0
+        return {
+            '待采集市场': n,
+            '模式': f'v2 批量 condition（每组≤{step} 市场）',
+            '组数': len(groups),
+            '抽样组数': probed,
+            '样本组平均页数(下界)': round(avg_pages, 2),
+            '最低请求数': len(groups),
+            '预估请求数(下界)': int(len(groups) * avg_pages),
+        }
+
     avg_pages = 1.0
     probed = 0
     if probe > 0:
@@ -107,15 +139,19 @@ async def dry_run_users(probe: int) -> dict:
     n = await db_pg.count_pending_wallets()
     if n == 0:
         return {'待采集用户': 0, '预估请求数': 0}
+    if config.DATA_API_V2:
+        path = '/v2/activity'
+        params_fn = lambda w: {'user': w, 'limit': config.ACTIVITY_PAGE_SIZE}
+    else:
+        path = '/activity'
+        params_fn = lambda w: {'user': w, 'limit': config.ACTIVITY_PAGE_SIZE, 'offset': 0}
     avg_pages = 1.0
     probed = 0
     if probe > 0:
         wallets = await db_pg.get_pending_wallets(probe)
         async with DataAPIClient(bucket=TokenBucket(capacity=config.TRADES_RATE_LIMIT)) as api:
             avg_pages = await _probe_pages(
-                api, '/activity', config.ACTIVITY_PAGE_SIZE,
-                lambda w: {'user': w, 'limit': config.ACTIVITY_PAGE_SIZE, 'offset': 0},
-                wallets,
+                api, path, config.ACTIVITY_PAGE_SIZE, params_fn, wallets,
             )
         probed = len(wallets)
     return {

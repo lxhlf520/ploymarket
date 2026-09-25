@@ -175,10 +175,12 @@ PRICE_FIDELITY_DAILY = 720       # 日级/跨天：fidelity=720（5 分钟粒度
 PRICE_FIDELITY_INTRADAY = 10     # 近 24h：fidelity=10（10 秒粒度）
 
 # Data API 采集参数
-# /trades: limit<=10000, offset<=10000；/activity: limit<=500, offset<=5000
-# 两接口均支持 end 时间戳过滤，统一用 end 窗口翻页突破 offset 上限
-TRADES_PAGE_SIZE = 1000          # /trades 单页条数
-ACTIVITY_PAGE_SIZE = 500         # /activity 单页条数（接口上限 500）
+# v1 于 2026-10-24 退役：v2 用 cursor 翻页（不再依赖 end 窗口）+ 批量 condition（≤20/请求）
+# + snake_case 行 + {data, pagination} envelope；设 DATA_API_V2=0 可临时回退 v1
+DATA_API_V2 = os.environ.get('DATA_API_V2', '1') != '0'
+TRADES_PAGE_SIZE = 1000          # /trades 单页条数（v2 上限 1000）
+ACTIVITY_PAGE_SIZE = 1000        # /activity 单页条数（v2 上限 1000，v1 上限 500）
+TRADES_BATCH_SIZE = 20           # Phase A 批量 condition 数（v2 上限 20/请求）
 TRADES_RATE_LIMIT = 200          # Data API /trades+/activity 共享预算：次/10 秒
 TRADES_CONCURRENCY = 16          # 并发市场/用户采集数
 DATA_TIMEOUT = 60                # Data API 超时秒数（Cloudflare 先减速后 429，慢响应视为成功）
