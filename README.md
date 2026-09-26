@@ -106,7 +106,16 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 
 ### 启动
 
-多开 PowerShell 窗口，每个窗口一个 worker、各带不同代理端口：
+**一键启动（推荐）**：
+
+```bash
+python start_all.py            # 幂等全流程：initdb → 代理池（自动探测订阅/内核）→ events（空则采）→ 起 N 个 worker
+python start_all.py --dry-run  # 先空跑检查：只打印将执行的动作
+```
+
+每步幂等、可反复跑；worker 启动时自动把 `events` 灌入任务队列（`activity_tasks`）——首次部署和日常重启都用它。
+
+手动方式（多开 PowerShell 窗口，每个窗口一个 worker、各带不同代理端口）：
 
 ```powershell
 # 窗口 1
@@ -134,7 +143,8 @@ start_workers.bat
 - 切换**无需重建 HTTP 客户端**：采集连接都走实例 mixed 端口，组切换后新请求自动走新节点
 
 ```powershell
-# 1. 从机场订阅生成 N 份实例配置（输出 clash_worker/w1..n.yaml + 启停脚本；需 pip install pyyaml）
+# 1. 从机场订阅生成 N 份实例配置（自动探测订阅与 mihomo 内核；
+#    输出 clash_worker/w1..n.yaml + 启停脚本；需 pip install pyyaml）
 python make_worker_clash.py --n 3
 
 # 2. 一键启动（mihomo 实例 × N + worker × N，实例端口自动配对）

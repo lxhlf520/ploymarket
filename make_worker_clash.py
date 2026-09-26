@@ -6,9 +6,13 @@
 mihomo 实例（独立 mixed 端口 + 独立 selector 组），worker 通过 controller API
 在 429/403 时自动切换本实例节点换 IP（clash_pool.AsyncNodeRotator）。
 
-用法（polymarket 目录下）：
+用法（polymarket 目录下，订阅与内核会自动探测，一般无需参数）：
     python make_worker_clash.py --n 3
-    python make_worker_clash.py --n 3 --src ../trading/clash_config.yaml
+    python make_worker_clash.py --n 3 --src ../trading/clash_config.yaml   # 显式指定订阅
+
+自动探测规则：
+    订阅：polymarket/clash_config.yaml → ../trading/clash_config.yaml
+    内核：clash_worker/mihomo*.exe → mihomo_core/mihomo*.exe → 本机快安/Clash Verge
 
 输出 clash_worker/：
     w1.yaml w2.yaml ...        每实例配置（mixed 7901+i / controller 9101+i）
@@ -19,9 +23,13 @@ mihomo 实例（独立 mixed 端口 + 独立 selector 组），worker 通过 con
 """
 import argparse
 import ctypes
+import glob
 import os
 
 import yaml
+
+# 订阅配置自动探测顺序（相对脚本目录）
+DEFAULT_SRC_CANDIDATES = ['clash_config.yaml', '../trading/clash_config.yaml']
 
 # polymarket 相关域名与出口 IP 探测站都走 PM 组；其余直连
 PM_GROUP = 'PM'
@@ -31,13 +39,31 @@ RULES = [
     'MATCH,DIRECT',
 ]
 
+# 项目内自带的 mihomo 内核目录（跨机器部署时随包携带）
+CORE_SUBDIRS = ['clash_worker', 'mihomo_core']
 DEFAULT_CORE_CANDIDATES = [
     r'C:\Program Files\快安\core\KuaiAnCore.exe',   # 快安客户端内置 Mihomo Meta
     r'C:\Program Files\Clash Verge\mihomo.exe',
 ]
 
 
+def find_src() -> str:
+    """自动探测订阅配置：脚本目录 clash_config.yaml → ../trading/clash_config.yaml"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for rel in DEFAULT_SRC_CANDIDATES:
+        p = os.path.normpath(os.path.join(base, rel))
+        if os.path.isfile(p):
+            return p
+    return ''
+
+
 def find_core() -> str:
+    """自动探测内核：项目内 mihomo*.exe（clash_worker/、mihomo_core/）→ 本机客户端内置"""
+    base = os.path.dirname(os.path.abspath(__file__))
+    for sub in CORE_SUBDIRS:
+        hits = sorted(glob.glob(os.path.join(base, sub, 'mihomo*.exe')))
+        if hits:
+            return hits[0]
     for p in DEFAULT_CORE_CANDIDATES:
         if os.path.isfile(p):
             return p
@@ -80,8 +106,8 @@ def gen_config(src: dict, mixed_port: int, ctl_port: int, secret: str) -> dict:
 def main():
     parser = argparse.ArgumentParser(description='生成 worker 专用 mihomo 配置')
     parser.add_argument('--n', type=int, default=3, help='实例数（默认 3）')
-    parser.add_argument('--src', default='../trading/clash_config.yaml',
-                        help='机场订阅配置路径')
+    parser.add_argument('--src', default=None,
+                        help='机场订阅配置路径（默认自动探测：clash_config.yaml / ../trading/clash_config.yaml）')
     parser.add_argument('--mixed-start', type=int, default=7901,
                         help='mixed 起始端口（默认 7901，避开常用 7890）')
     parser.add_argument('--ctl-start', type=int, default=9101,
@@ -91,8 +117,14 @@ def main():
     parser.add_argument('--out', default='clash_worker', help='输出目录')
     args = parser.parse_args()
 
-    src_path = os.path.normpath(os.path.join(os.path.dirname(__file__), args.src)) \
-        if not os.path.isabs(args.src) else args.src
+    if args.src:
+        src_path = os.path.normpath(os.path.join(os.path.dirname(__file__), args.src)) \
+            if not os.path.isabs(args.src) else args.src
+    else:
+        src_path = find_src()
+        if not src_path:
+            raise SystemExit('未找到订阅配置：请把机场订阅 yaml 放到 polymarket\\clash_config.yaml'
+                             '（或用 --src 指定路径）')
     with open(src_path, encoding='utf-8') as f:
         src = yaml.safe_load(f)
     proxies = src.get('proxies') or []
