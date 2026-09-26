@@ -2,27 +2,53 @@
 
 Polymarket 全量交易数据采集系统：通过 Data API 拉取全市场历史成交与用户活动流，并经 Polygon RPC 回填每笔交易的链上收据，落地 PostgreSQL。
 
+## 快速开始
+
+```powershell
+pip install -r requirements.txt   # 首次
+copy .env.example .env            # 首次：填 PostgreSQL 连接信息
+python poly.py                    # 唯一入口：建库 → 代理池配置 → mihomo 实例 → events → N 个 worker
+```
+
+`python poly.py` 幂等可反复跑；Ctrl+C 一次全停（worker + 本次启动的 mihomo 实例）；`python poly.py status` 看状态，`python poly.py stop` 清残留。详见下文《分布式多任务采集》。
+
 ## 数据架构
 
 | 表 | 说明 |
 |---|---|
 | `trades` | 每笔交易/活动明细（19+ 字段 + raw_json），自然键去重，Phase A/B 共用 |
+| `events` | 事件 + 嵌套市场（Gamma 采集落地，也是 worker 任务队列的数据源） |
+| `markets` | 市场详情（clobTokenIds / 描述等，details 阶段补拉） |
+| `activity_tasks` | worker 任务队列（event 级状态机 pending/running/done/failed + 租约） |
 | `users` | 用户聚合画像（笔数、时间范围、昵称/头像，从 trades 聚合刷新） |
 | `tx_receipts` | Polygon 链上收据（区块号/区块时间/gas/status/from/to 等），按哈希去重回填一次 |
 | `blocks` | 区块时间戳缓存（避免重复 `eth_getBlockByNumber`） |
 | `scrape_progress` | 断点续传进度（scope 粒度：`market:{conditionId}` / `user:{wallet}`） |
 
+其余表（`comments` / `holders` / `positions` / `price_history` / `orderbook` / `market_clarifications`）对应 `main_collect.py` 的各个阶段，完整字段见 `DATABASE_SCHEMA.md`。
+
 ## 目录结构
 
 ```
 ploymarket/
-├── main_trades.py          # CLI 编排入口（各阶段/试跑/估算）
+├── poly.py                 # ★ 统一入口：run（一键跑起来）/ status / stop
+├── main_collect.py         # 全模块采集 CLI（initdb/stats/events/details/comments/
+│                           #   holders/positions/activity/prices/orderbook/all）
+├── worker_activity.py      # 分布式 worker（领任务→采集→写库；poly 同进程并发 N 个）
+├── make_worker_clash.py    # 代理池配置生成（订阅 → clash_worker/w1..N.yaml + 内核探测/解压）
+├── clash_pool.py           # mihomo 节点轮换器（429/403 自动切节点换出口 IP）
+├── db_pg.py                # PostgreSQL 建库建表、批量 upsert、任务队列与进度管理
+├── config.py               # 全部配置（数据库连接从 .env / 环境变量读取）
+├── data_api_client.py      # Data API 客户端（限流/重试/翻页）
+├── gamma_client.py         # Gamma API 客户端（事件/市场/评论）
+├── clob_client.py          # CLOB API 客户端（价格历史/盘口）
+├── scraper_gamma.py        # events / details / clarifications / comments 采集
+├── scraper_data.py         # holders / positions / activity 采集
+├── scraper_clob.py         # prices / orderbook 采集
+├── main_trades.py          # 早期 trades 三阶段 CLI（Phase A/B/C，保留）
 ├── scraper_trades.py       # Phase A 全市场交易 + Phase B 用户活动流
 ├── scraper_tx_enrich.py    # Phase C Polygon RPC 链上回填
-├── data_api_client.py      # Data API 客户端（限流/重试/end 窗口深翻页）
-├── db_pg.py                # PostgreSQL 建库建表、批量 upsert、进度管理
-├── config.py               # 全部配置（数据库连接从 .env / 环境变量读取）
-├── export_condition_ids.py # 从旧 SQLite 库导出 conditionId 种子文件（可选）
+├── export_cookie.py        # 导出登录态 cookie（comments 需要）
 ├── condition_ids.txt       # 市场种子（65k+ conditionId，Phase A 数据源）
 ├── requirements.txt
 └── .env.example            # 数据库配置模板（复制为 .env 后填写）
@@ -54,7 +80,7 @@ cp .env.example .env     # Windows: copy .env.example .env
 ## 初始化（幂等）
 
 ```bash
-python main_trades.py --stage initdb   # 自动建库 polymarket + 建表 + 建索引
+python main_collect.py --stage initdb   # 自动建库 polymarket + 建表 + 建索引（python poly.py 的第一步）
 ```
 
 ## 采集三阶段
@@ -95,7 +121,7 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 
 ## 分布式多任务采集（activity/trades）
 
-> 当前主入口为 `main_collect.py`（全模块采集）；本章节为 trades 全量采集的多进程并行方案。
+> 全模块采集 CLI 是 `main_collect.py`；本章节是 activity/trades 分布式并行方案，日常入口只有 `poly.py`（实例 + 数据 + worker 一条命令）。
 
 ### 原理
 
@@ -104,35 +130,47 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 - 领取用 `FOR UPDATE SKIP LOCKED` 原子操作：多 worker 并发领取**永不重复**；worker 被强杀后其 running 任务**租约超时自动回收**，其他 worker 接管
 - 多 worker 写同一 PG 库：trades upsert 幂等，无脏数据
 
-### 启动
-
-**一键启动（推荐）**：
-
-```bash
-python start_all.py            # 幂等全流程：initdb → 代理池（自动探测订阅/内核）→ events（空则采）→ 起 N 个 worker
-python start_all.py --dry-run  # 先空跑检查：只打印将执行的动作
-python start_all.py --collect-events 2   # 试跑：强制先小量采 2 个事件验证链路（不带数字=全量补采）
-```
-
-每步幂等、可反复跑；worker 启动时自动把 `events` 灌入任务队列（`activity_tasks`）——首次部署和日常重启都用它。
-
-手动方式（多开 PowerShell 窗口，每个窗口一个 worker、各带不同代理端口）：
+### 启动（唯一入口：poly.py）
 
 ```powershell
-# 窗口 1
-python worker_activity.py --proxy http://127.0.0.1:7890 --worker-id w1 --jobs 3
-
-# 窗口 2
-python worker_activity.py --proxy http://127.0.0.1:7891 --worker-id w2 --jobs 3
-
-# 窗口 3（直连）
-python worker_activity.py --worker-id w3 --jobs 3
-
-# 或一键启动（start_workers.bat，按需改代理端口）
-start_workers.bat
+python poly.py            # 一键跑起来（幂等，反复跑不会重复起）
+python poly.py status     # 状态：DB 统计 / 实例端口 / poly 主进程
+python poly.py stop       # 清残留：停掉 poly 启动的 mihomo 实例
 ```
 
-参数：`--proxy`（本进程出口代理，不填=直连）、`--jobs`（同时采的事件数，默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）。
+`poly.py` 的 run 流程（每步先检查现状再动作）：
+
+| 步骤 | 动作 |
+|---|---|
+| [1/5] 建库建表 | `main_collect.py --stage initdb`（幂等） |
+| [2/5] 代理池配置 | `clash_worker/w1..wN.yaml` 缺失/无节点/内核未就位 → 自动生成（自动探测订阅与 mihomo 内核，`mihomo*.zip` 自动解压） |
+| [3/5] 实例 | 后台无窗口起 N 个 mihomo（日志 `clash_worker/mihomo-wN.log`），端口已在监听的直接复用 |
+| [4/5] 事件数据 | `events` 表为空 → 自动采集（经 w1 实例出口）；已非空则跳过 |
+| [5/5] worker | 同进程并发 N 个 worker（日志带 `[w1]`/`[w2]` 前缀），后台每 60 秒自动把 events 灌入任务队列 |
+
+- Ctrl+C **一次全停**（worker + 本次启动的 mihomo 实例）；关窗口/强杀后用 `python poly.py stop` 清残留实例
+- events 补采后**不需要重启 worker**：队列每 60s 自动补充（幂等）
+- worker 启动时会把 `scrape_progress` 里已完成的 activity 断点单向迁移进任务队列
+
+```powershell
+python poly.py                        # 部署 / 日常重启都用它
+python poly.py --dry-run              # 先空跑检查：只打印将执行的动作
+python poly.py --collect-events 2     # 试跑：强制小量采 2 个事件验证链路（不带数字=全量补采）
+python poly.py --duration 60          # 挂 60 秒验证全链路后自动优雅停止
+python poly.py --n 5 --jobs 4         # 5 个实例/worker，每个并发 4 个事件
+python poly.py status                 # 看 events/队列/trades 统计 + 实例端口 + 主进程
+```
+
+run 参数：`--n`（实例数=worker 数，默认 3）、`--jobs`（每 worker 并发事件数，默认 3）、`--collect-events [N]`（强制采集 events；跟数字=先小量试跑，不带数字=全量补采）、`--no-events`（跳过事件检查）、`--duration N`（跑 N 秒后自动优雅停止，0=一直跑）、`--dry-run`。
+
+单实例调试（不走 poly，手动指定代理或直连）：
+
+```powershell
+python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1 --jobs 3
+python worker_activity.py --worker-id w4 --jobs 3   # 不填 --proxy = 直连
+```
+
+worker 参数：`--proxy`、`--jobs`（默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）、`--rotate-after`（每 N 请求主动换节点，默认 150，0=仅限流时切换）、`--max-delay`（节点预筛延迟上限 ms，默认 10000）。
 
 ### 限流自动切节点（mihomo 代理池，推荐）
 
@@ -141,30 +179,26 @@ start_workers.bat
 - **触发**：429 累计 3 次（防抖）/ 403 / 连接级错误（死节点）→ 自动切换
 - **切换逻辑**：ban 当前节点 + 出口 IP（冷却 15 分钟）→ 轮询组内下一可用节点（切不动/出口 IP 仍在冷却的自动跳过）→ 验证新出口 IP → 暂停 5 秒等生效 → 继续采集
 - **主动轮换**：每 150 次请求主动换一个 IP（`--rotate-after`，0=仅限流时切换），摊薄单 IP 请求量
+- **启动预筛**：实例就绪后先测一遍节点延迟，超过 `--max-delay`（默认 10000ms）的跳过，避免一上来撞死节点
 - 切换**无需重建 HTTP 客户端**：采集连接都走实例 mixed 端口，组切换后新请求自动走新节点
 
+配置生成与实例起停**全部由 `poly.py` 自动完成**（`clash_worker/` 下的 w1..wN.yaml 与 mihomo 实例都归它管）：
+
 ```powershell
-# 1. 从机场订阅生成 N 份实例配置（自动探测订阅与 mihomo 内核；
-#    输出 clash_worker/w1..n.yaml + 启停脚本；需 pip install pyyaml）
+python poly.py            # 生成缺失配置 + 后台起实例 + 起 worker（日常只用这条）
+python poly.py status     # 看实例端口是否在监听
+python poly.py stop       # 停掉 poly 起的全部实例
+
+# 只想重新生成配置（如机场订阅换了节点）：
 python make_worker_clash.py --n 3
-
-# 2. 一键启动（mihomo 实例 × N + worker × N，实例端口自动配对）
-start_workers.bat
-
-# 或手动：先起实例，再每个窗口一个 worker
-clash_worker\start_mihomo.bat
-python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1 --jobs 3
-python worker_activity.py --proxy http://127.0.0.1:7902 --clash-base http://127.0.0.1:9102 --worker-id w2 --jobs 3
-python worker_activity.py --proxy http://127.0.0.1:7903 --clash-base http://127.0.0.1:9103 --worker-id w3 --jobs 3
-
-# 停止实例
-clash_worker\stop_mihomo.bat
 ```
+
+端口配对（w1 示例）：mixed `7901` ↔ controller `9101`，w2 → `7902`/`9102`，以此类推；controller secret 统一 `pm-worker`，节点组名 `PM`。
 
 说明：
 - `--clash-base` 指向该 worker 专属实例的 external-controller；不配则退化为静态 `--proxy`（行为不变）
 - `clash_worker/` 含机场节点凭据，已在 .gitignore 中排除，每台机器自行生成
-- mihomo 内核默认借用快安客户端内置的 Mihomo Meta（`C:\Program Files\快安\core\KuaiAnCore.exe`），其他内核用 `--core` 指定
+- mihomo 内核探测顺序：项目目录 `mihomo*.zip`（自动解压到 `mihomo_core/`）→ `clash_worker/mihomo*.exe` → `mihomo_core/mihomo*.exe` → 本机快安 / Clash Verge 自带内核；也可手动把内核 exe 放进前两个目录
 - 节点池越大越好：死节点自动跳过（短冷却 5 分钟），被限流节点/出口 IP 冷却 15 分钟
 
 ### 状态监控
@@ -187,4 +221,4 @@ UPDATE activity_tasks SET status = 'pending', attempts = 0 WHERE status = 'faile
 1. **不要混跑**：worker 模式与 `main_collect.py --stage activity` 单机模式使用不同进度表（`activity_tasks` vs `scrape_progress`），同时跑会重复采集（幂等不脏数据，但浪费配额）。worker 启动时会把 `scrape_progress` 中已完成的 done 断点**单向迁移**进任务队列
 2. **代理要求**：每个 worker 一个独立出口 IP（独立隧道代理端口，或 mihomo 代理池模式下的专属实例）；多个 worker 共用同一出口 IP 无扩展效果（限流共享）
 3. **jobs 建议 2-4**：单 IP 配额 200 req/10s，jobs 过大只是排队
-4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；强杀场景租约超时（默认 15 分钟）自动回收
+4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；`poly.py` 模式下 Ctrl+C 会同时停掉本次启动的 mihomo 实例。强杀/关窗口场景租约超时（默认 15 分钟）自动回收任务，mihomo 残留用 `python poly.py stop` 清理

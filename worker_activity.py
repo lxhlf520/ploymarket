@@ -1,18 +1,19 @@
 # !/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""activity 分布式 worker（单机多进程，每进程独立隧道代理出口）
+"""activity 分布式 worker 核心（事件级任务队列，多实例可同进程并发）
 
 - 任务队列：PG activity_tasks 表（event 级状态机 pending/running/done/failed）
 - 领取：claim_activity_task 原子领取（FOR UPDATE SKIP LOCKED），多 worker 并发不重复
 - 租约：running 超时自动回收——worker 被强杀后其任务由其他 worker 接管
-- 出口：每进程经 --proxy 走独立隧道代理（独立出口 IP → 独立 200 req/10s 限流配额）
+- 出口：经 --proxy 走独立隧道代理（独立出口 IP → 独立 200 req/10s 限流配额）
 - 限流自动切节点（可选）：--clash-base 指向 worker 专用 mihomo 实例的 controller，
   429 累计 3 次/403 → ban 当前节点与出口 IP → 自动切下一节点继续采集
-  （配合 make_worker_clash.py 生成配置，实现多实例并行轮换，详见 README）
 
-用法（多开 PowerShell 窗口，各带不同代理端口）：
+统一入口（推荐，不用直接运行本文件）：
+    python poly.py            # 一键：实例 + events + 多 worker（日志 [w1]/[w2] 前缀）
+    python poly.py status     # 看状态
+单实例调试仍可用：
     python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1
-    python worker_activity.py --proxy http://127.0.0.1:7891 --worker-id w2 --jobs 3
     python worker_activity.py --idle-wait 0          # 队列空即退出（一次性模式）
 
 注意：与 main_collect.py --stage activity 单机模式不要混跑（进度表互相隔离，
@@ -21,6 +22,7 @@ worker 初始化时会把 scrape_progress 的 done 单向迁移进任务队列�
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
 import socket
@@ -34,14 +36,132 @@ import db_pg
 import scraper_data
 from data_api_client import DataAPIClient, TokenBucket
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(name)s: %(message)s',
-    datefmt='%H:%M:%S',
-)
 logger = logging.getLogger('polymarket_worker')
 
 STATS_INTERVAL = 30  # 队列统计打印间隔（秒）
+
+
+class _Prefixed(logging.LoggerAdapter):
+    """日志消息加 [wid] 前缀，同进程多 worker 时区分来源"""
+
+    def process(self, msg, kwargs):
+        return f'[{self.extra["wid"]}] {msg}', kwargs
+
+
+async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: str = None,
+                     clash_secret: str = 'pm-worker', clash_group: str = 'PM',
+                     jobs: int = 3, lease_min: int = 15, max_attempts: int = 5,
+                     idle_wait: int = 30, rotate_after: int = 150,
+                     max_delay: int = 10000, progress: bool = True) -> dict:
+    """单 worker 采集循环（供 poly.py 同进程并发多实例，或 CLI 单实例）
+
+    idle_wait=0 时队列空即返回；返回 {'done': 完成事件数, 'rows': 采集行数}
+    """
+    wid = worker_id or f'{socket.gethostname()}:{os.getpid()}'
+    log = _Prefixed(logging.getLogger('polymarket_worker'), {'wid': wid})
+
+    # 幂等初始化任务队列（单向迁移 scrape_progress 的 activity done 断点）
+    init = await db_pg.init_activity_tasks()
+
+    # 节点轮换器：--clash-base 指向 worker 专用 mihomo 实例时启用
+    rotator = None
+    if clash_base:
+        api = clash_pool.ClashAPI(base=clash_base, secret=clash_secret,
+                                  group=clash_group, mixed=proxy)
+        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=rotate_after,
+                                              max_delay_ms=max_delay)
+        if not await rotator.load_nodes():
+            log.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
+            with contextlib.suppress(BaseException):
+                await api.close()
+            rotator = None
+        else:
+            await rotator.start_health_check()
+
+    log.info('worker 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
+             proxy or (f'系统代理 {config.SYSTEM_PROXY}' if config.SYSTEM_PROXY else '直连'),
+             jobs, f'{len(rotator.nodes)}节点' if rotator else '关', init['stats'])
+
+    bucket = TokenBucket(capacity=config.TRADES_RATE_LIMIT)
+    worker_done = 0
+    worker_rows = 0
+    pbar = tqdm(desc=f'worker {wid}', unit='evt', dynamic_ncols=True) if progress else None
+    running = set()          # 进行中的采集协程
+
+    try:
+        async with DataAPIClient(
+                bucket=bucket, proxy=proxy,
+                on_request=rotator.on_request if rotator else None,
+                on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
+
+            async def job(eid: str, attempts: int) -> None:
+                """领取后的事件采集任务：成功标 done，失败按 attempts 回 pending 或死信"""
+                nonlocal worker_done, worker_rows
+                try:
+                    total, ins, upd = await scraper_data.collect_event_activity(api, eid)
+                    await db_pg.complete_activity_task(eid, total)
+                    worker_done += 1
+                    worker_rows += total
+                    if pbar:
+                        pbar.update(1)
+                        pbar.set_postfix(rows=worker_rows, done=worker_done)
+                    log.info('事件 %s 完成: %s 行 (ins=%s upd=%s)', eid, total, ins, upd)
+                except Exception as exc:
+                    status = await db_pg.fail_activity_task(eid, str(exc), max_attempts)
+                    if pbar:
+                        pbar.update(1)
+                    log.warning('事件 %s 失败 (第%s次→%s): %s', eid, attempts, status, exc)
+
+            next_stats = time.monotonic() + STATS_INTERVAL
+            while True:
+                # 收割已完成协程
+                running = {t for t in running if not t.done()}
+                # 补满协程池（领到空即停）
+                while len(running) < jobs:
+                    task = await db_pg.claim_activity_task(wid, lease_min)
+                    if not task:
+                        break
+                    log.info('领取事件 %s (第%s次尝试)', task['event_id'], task['attempts'])
+                    running.add(asyncio.create_task(
+                        job(task['event_id'], task['attempts'])))
+
+                if not running:
+                    if idle_wait <= 0:
+                        log.info('队列已空，worker 退出 (完成 %s 事件 / %s 行)',
+                                 worker_done, worker_rows)
+                        break
+                    await asyncio.sleep(min(idle_wait, 5))
+                    continue
+
+                # 等待任一协程结束（1s 粒度轮询，兼顾统计打印）
+                done_set, running = await asyncio.wait(
+                    running, timeout=1, return_when=asyncio.FIRST_COMPLETED)
+                for t in done_set:
+                    t.exception()          # 消费异常避免告警（job 内部已兜底）
+
+                if time.monotonic() >= next_stats:
+                    stats = await db_pg.activity_task_stats()
+                    log.info('队列: %s | 本 worker: %s 事件 / %s 行',
+                             stats, worker_done, worker_rows)
+                    next_stats = time.monotonic() + STATS_INTERVAL
+    except asyncio.CancelledError:
+        # Ctrl+C：停止领新任务，等在采事件完成后退出；
+        # 强杀（二次中断/杀进程）场景由租约超时自动回收，其他 worker 接管
+        log.info('收到中断: 停止领取新任务，等待在采事件完成...')
+        if running:
+            await asyncio.gather(*running, return_exceptions=True)
+        log.info('在采事件已全部结束，worker 退出 (共 %s 事件 / %s 行)',
+                 worker_done, worker_rows)
+        raise
+    finally:
+        if pbar:
+            pbar.close()
+        if rotator:
+            with contextlib.suppress(BaseException):
+                await rotator.stop_health_check()
+            with contextlib.suppress(BaseException):
+                await rotator.api.close()
+    return {'done': worker_done, 'rows': worker_rows}
 
 
 def parse_args():
@@ -72,108 +192,23 @@ def parse_args():
     return parser.parse_args()
 
 
-async def amain(args):
-    # 幂等初始化任务队列（单向迁移 scrape_progress 的 activity done 断点）
-    init = await db_pg.init_activity_tasks()
-
-    # 节点轮换器：--clash-base 指向 worker 专用 mihomo 实例时启用
-    rotator = None
-    if args.clash_base:
-        api = clash_pool.ClashAPI(base=args.clash_base, secret=args.clash_secret,
-                                  group=args.clash_group, mixed=args.proxy)
-        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=args.rotate_after,
-                                               max_delay_ms=args.max_delay)
-        if not await rotator.load_nodes():
-            logger.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
-            rotator = None
-        else:
-            await rotator.start_health_check()
-
-    logger.info('worker %s 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
-                args.worker_id,
-                args.proxy or (f'系统代理 {config.SYSTEM_PROXY}' if config.SYSTEM_PROXY else '直连'),
-                args.jobs,
-                f'{len(rotator.nodes)}节点' if rotator else '关', init['stats'])
-
-    bucket = TokenBucket(capacity=config.TRADES_RATE_LIMIT)
-    worker_done = 0
-    worker_rows = 0
-    pbar = tqdm(desc=f'worker {args.worker_id}', unit='evt', dynamic_ncols=True)
-
-    async with DataAPIClient(
-            bucket=bucket, proxy=args.proxy,
-            on_request=rotator.on_request if rotator else None,
-            on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
-
-        async def job(eid: str, attempts: int) -> None:
-            """领取后的事件采集任务：成功标 done，失败按 attempts 回 pending 或死信"""
-            nonlocal worker_done, worker_rows
-            try:
-                total, ins, upd = await scraper_data.collect_event_activity(api, eid)
-                await db_pg.complete_activity_task(eid, total)
-                worker_done += 1
-                worker_rows += total
-                pbar.update(1)
-                pbar.set_postfix(rows=worker_rows, done=worker_done)
-                logger.info('事件 %s 完成: %s 行 (ins=%s upd=%s)', eid, total, ins, upd)
-            except Exception as exc:
-                status = await db_pg.fail_activity_task(eid, str(exc), args.max_attempts)
-                pbar.update(1)
-                logger.warning('事件 %s 失败 (第%s次→%s): %s', eid, attempts, status, exc)
-
-        running = set()          # 进行中的采集协程
-        next_stats = time.monotonic() + STATS_INTERVAL
-        try:
-            while True:
-                # 收割已完成协程
-                running = {t for t in running if not t.done()}
-                # 补满协程池（领到空即停）
-                while len(running) < args.jobs:
-                    task = await db_pg.claim_activity_task(args.worker_id, args.lease_min)
-                    if not task:
-                        break
-                    logger.info('领取事件 %s (第%s次尝试)', task['event_id'], task['attempts'])
-                    running.add(asyncio.create_task(
-                        job(task['event_id'], task['attempts'])))
-
-                if not running:
-                    if args.idle_wait <= 0:
-                        logger.info('队列已空，worker 退出 (本进程完成 %s 事件 / %s 行)',
-                                    worker_done, worker_rows)
-                        break
-                    await asyncio.sleep(min(args.idle_wait, 5))
-                    continue
-
-                # 等待任一协程结束（1s 粒度轮询，兼顾统计打印）
-                done_set, running = await asyncio.wait(
-                    running, timeout=1, return_when=asyncio.FIRST_COMPLETED)
-                for t in done_set:
-                    t.exception()          # 消费异常避免告警（job 内部已兜底）
-
-                if time.monotonic() >= next_stats:
-                    stats = await db_pg.activity_task_stats()
-                    logger.info('队列: %s | 本 worker: %s 事件 / %s 行',
-                                stats, worker_done, worker_rows)
-                    next_stats = time.monotonic() + STATS_INTERVAL
-        except asyncio.CancelledError:
-            # Ctrl+C：停止领新任务，等在采事件完成后退出；
-            # 强杀（二次中断/杀进程）场景由租约超时自动回收，其他 worker 接管
-            logger.info('收到中断: 停止领取新任务，等待在采事件完成...')
-            if running:
-                await asyncio.gather(*running, return_exceptions=True)
-            logger.info('在采事件已全部结束，worker 退出 (共 %s 事件 / %s 行)',
-                        worker_done, worker_rows)
-            raise
-
-
 def main():
     args = parse_args()
-    if not args.worker_id:
-        args.worker_id = f'{socket.gethostname()}:{os.getpid()}'
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+        datefmt='%H:%M:%S',
+    )
+    logging.getLogger('httpx').setLevel(logging.WARNING)   # 压掉每请求一行
     if args.jobs < 1:
         raise SystemExit('--jobs 至少为 1')
     try:
-        asyncio.run(amain(args))
+        asyncio.run(run_worker(
+            args.worker_id, proxy=args.proxy, clash_base=args.clash_base,
+            clash_secret=args.clash_secret, clash_group=args.clash_group,
+            jobs=args.jobs, lease_min=args.lease_min,
+            max_attempts=args.max_attempts, idle_wait=args.idle_wait,
+            rotate_after=args.rotate_after, max_delay=args.max_delay))
     except KeyboardInterrupt:
         logger.info('worker 已退出')
 
