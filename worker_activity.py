@@ -23,10 +23,12 @@ worker 初始化时会把 scrape_progress 的 done 单向迁移进任务队列�
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import logging
 import os
 import socket
 import time
+import urllib.parse
 
 from tqdm import tqdm
 
@@ -38,7 +40,13 @@ from data_api_client import DataAPIClient, TokenBucket
 
 logger = logging.getLogger('polymarket_worker')
 
-STATS_INTERVAL = 30  # 队列统计打印间隔（秒）
+STATS_INTERVAL = 30       # 队列统计打印间隔（秒）
+PROXY_CHECK_INTERVAL = 5  # 代理实例端口探测间隔（秒）
+DB_BACKOFF_MAX = 30       # DB 瞬时故障退避上限（秒）
+ROTATOR_INIT_RETRY = 3    # 轮换器初始化重试次数（实例刚重启时别急着降级为静态代理）
+
+# 当前 worker 标识（poly.py 按它把日志分流到 logs/wN.log；单实例 CLI 下同样有值）
+CURRENT_WORKER = contextvars.ContextVar('polymarket_worker_id', default=None)
 
 
 class _Prefixed(logging.LoggerAdapter):
@@ -46,6 +54,25 @@ class _Prefixed(logging.LoggerAdapter):
 
     def process(self, msg, kwargs):
         return f'[{self.extra["wid"]}] {msg}', kwargs
+
+
+def _proxy_up(proxy: str) -> bool:
+    """本机代理端口探测（poly 启的 mihomo 实例）：实例掉线时暂停领任务，避免把事件烧成死信。
+
+    远程/隧道代理无法端口探测，一律按可用处理（连接级失败交给请求重试与节点轮换）。
+    """
+    if not proxy:
+        return True
+    try:
+        parts = urllib.parse.urlsplit(proxy)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return True
+    if not port or host not in ('127.0.0.1', 'localhost', '::1'):
+        return True
+    with socket.socket() as s:
+        s.settimeout(1.0)
+        return s.connect_ex((host, port)) == 0
 
 
 async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: str = None,
@@ -58,10 +85,19 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
     idle_wait=0 时队列空即返回；返回 {'done': 完成事件数, 'rows': 采集行数}
     """
     wid = worker_id or f'{socket.gethostname()}:{os.getpid()}'
+    CURRENT_WORKER.set(wid)      # poly.py 按此把日志分流到 logs/wN.log
     log = _Prefixed(logging.getLogger('polymarket_worker'), {'wid': wid})
 
     # 幂等初始化任务队列（单向迁移 scrape_progress 的 activity done 断点）
-    init = await db_pg.init_activity_tasks()
+    try:
+        init = await db_pg.init_activity_tasks()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # DB 瞬时不可用不该拦住启动：poly 每 60s 会重试补队列
+        log.warning('任务队列初始化失败（%s: %s），先启动；补队列会自动重试',
+                    type(exc).__name__, exc)
+        init = {'stats': '(查询失败)'}
 
     # 节点轮换器：--clash-base 指向 worker 专用 mihomo 实例时启用
     rotator = None
@@ -70,13 +106,21 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
                                   group=clash_group, mixed=proxy)
         rotator = clash_pool.AsyncNodeRotator(api, rotate_after=rotate_after,
                                               max_delay_ms=max_delay)
-        if not await rotator.load_nodes():
+        ok = False
+        for attempt in range(1, ROTATOR_INIT_RETRY + 1):
+            ok = await rotator.load_nodes()
+            if ok or attempt == ROTATOR_INIT_RETRY:
+                break
+            log.warning('节点轮换初始化失败（第 %d/%d 次），10 秒后重试',
+                        attempt, ROTATOR_INIT_RETRY)
+            await asyncio.sleep(10)
+        if ok:
+            await rotator.start_health_check()
+        else:
             log.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
             with contextlib.suppress(BaseException):
                 await api.close()
             rotator = None
-        else:
-            await rotator.start_health_check()
 
     log.info('worker 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
              proxy or (f'系统代理 {config.SYSTEM_PROXY}' if config.SYSTEM_PROXY else '直连'),
@@ -113,17 +157,45 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
                     log.warning('事件 %s 失败 (第%s次→%s): %s', eid, attempts, status, exc)
 
             next_stats = time.monotonic() + STATS_INTERVAL
+            proxy_ok = True              # 代理实例存活门禁（掉线时暂停领新任务）
+            proxy_warned = False
+            next_proxy_check = 0.0
+            db_retry_at = 0.0            # DB 抖动的下次领取时间（退避，不影响在采协程）
+            db_retry_delay = 0.0
             while True:
                 # 收割已完成协程
                 running = {t for t in running if not t.done()}
-                # 补满协程池（领到空即停）
-                while len(running) < jobs:
-                    task = await db_pg.claim_activity_task(wid, lease_min)
-                    if not task:
-                        break
-                    log.info('领取事件 %s (第%s次尝试)', task['event_id'], task['attempts'])
-                    running.add(asyncio.create_task(
-                        job(task['event_id'], task['attempts'])))
+
+                # 代理实例端口探测：实例挂了还在领任务，只是把事件白烧成死信
+                if time.monotonic() >= next_proxy_check:
+                    next_proxy_check = time.monotonic() + PROXY_CHECK_INTERVAL
+                    proxy_ok = _proxy_up(proxy)
+                    if not proxy_ok and not proxy_warned:
+                        log.error('代理实例不可用（%s），暂停领新任务（实例恢复后自动继续）',
+                                  proxy)
+                        proxy_warned = True
+                    elif proxy_ok and proxy_warned:
+                        log.info('代理实例已恢复（%s），继续领任务', proxy)
+                        proxy_warned = False
+
+                # 补满协程池（领到空即停）；DB 瞬时故障只退避重试，不让 worker 循环退出
+                if proxy_ok and time.monotonic() >= db_retry_at:
+                    try:
+                        while len(running) < jobs:
+                            task = await db_pg.claim_activity_task(wid, lease_min)
+                            if not task:
+                                break
+                            log.info('领取事件 %s (第%s次尝试)', task['event_id'], task['attempts'])
+                            running.add(asyncio.create_task(
+                                job(task['event_id'], task['attempts'])))
+                        db_retry_delay = 0.0
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        db_retry_delay = min(max(db_retry_delay * 2, 2.0), DB_BACKOFF_MAX)
+                        db_retry_at = time.monotonic() + db_retry_delay
+                        log.warning('领取任务失败（DB 抖动？%s: %s），%.0fs 后重试',
+                                    type(exc).__name__, exc, db_retry_delay)
 
                 if not running:
                     if idle_wait <= 0:
@@ -140,9 +212,14 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
                     t.exception()          # 消费异常避免告警（job 内部已兜底）
 
                 if time.monotonic() >= next_stats:
-                    stats = await db_pg.activity_task_stats()
-                    log.info('队列: %s | 本 worker: %s 事件 / %s 行',
-                             stats, worker_done, worker_rows)
+                    try:
+                        stats = await db_pg.activity_task_stats()
+                        log.info('队列: %s | 本 worker: %s 事件 / %s 行',
+                                 stats, worker_done, worker_rows)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.warning('队列统计失败（DB 抖动？%s: %s）', type(exc).__name__, exc)
                     next_stats = time.monotonic() + STATS_INTERVAL
     except asyncio.CancelledError:
         # Ctrl+C：停止领新任务，等在采事件完成后退出；

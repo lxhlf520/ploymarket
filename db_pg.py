@@ -9,6 +9,7 @@
 - scrape_progress: 断点续传进度
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -552,18 +553,47 @@ async def reset_pool() -> None:
         _pool = None
 
 
-async def execute_with_retry(coro_fn, *args, **kwargs):
-    """执行 DB 操作；InterfaceError 时重建池并重试一次（asyncpg 连接池回收陷阱）"""
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            return await coro_fn(conn, *args, **kwargs)
-    except asyncpg.exceptions.InterfaceError as exc:
-        logger.warning('连接池损坏，重建后重试: %s', exc)
-        await reset_pool()
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            return await coro_fn(conn, *args, **kwargs)
+# 可重试的瞬时故障：池内连接失效 / PG 重启中 / 网络抖动
+RETRYABLE_DB_ERRORS = (
+    asyncpg.exceptions.InterfaceError,               # 池内连接已被回收
+    asyncpg.exceptions.ConnectionDoesNotExistError,  # 连接已失效（PG 重启、空闲被掐）
+    asyncpg.exceptions.ConnectionFailureError,
+    asyncpg.exceptions.CannotConnectNowError,        # PG 正在启动/关闭
+    ConnectionResetError,
+    ConnectionRefusedError,
+)
+
+
+async def execute_with_retry(coro_fn, *args, max_attempts: int = 4, **kwargs):
+    """执行 DB 操作；瞬时故障（池损坏 / PG 重启 / 网络抖动）退避重试后再放弃。
+
+    长驻采集循环依赖这里兜住抖动：单次抖动不能让 worker 退出。
+    - InterfaceError：池内连接已被回收，重建池再试
+    - 连接类错误：等退避后重试，池内死连接由 asyncpg 自行替换（不重建池，避免影响并发调用方）
+    """
+    delay = 1.0
+    last_exc = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                return await coro_fn(conn, *args, **kwargs)
+        except RETRYABLE_DB_ERRORS as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                logger.error('DB 操作连续 %d 次失败，放弃本次操作: %s: %s',
+                             max_attempts, type(exc).__name__, exc)
+                break
+            if isinstance(exc, asyncpg.exceptions.InterfaceError):
+                logger.warning('连接池损坏，重建后重试（第 %d/%d 次）: %s',
+                               attempt, max_attempts, exc)
+                await reset_pool()
+            else:
+                logger.warning('DB 瞬时故障（%s），%.1fs 后重试（第 %d/%d 次）: %s',
+                               type(exc).__name__, delay, attempt, max_attempts, exc)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 15)
+    raise last_exc
 
 
 async def init_schema() -> None:
@@ -1176,6 +1206,32 @@ async def fail_activity_task(event_id: str, err: str, max_attempts: int = 5) -> 
             """,
             event_id, err, max_attempts,
         )
+
+    return await execute_with_retry(_do)
+
+
+async def retry_failed_activity_tasks(limit: int = None) -> int:
+    """把死信（failed）重置为 pending 重新入队，返回重置条数。
+
+    limit 限制单次处理条数（None=全部）；attempts 归零并清理持有者与租约，
+    避免旧 worker_id / 租约残留影响下一次领取。
+    """
+    async def _do(conn):
+        lim = f'LIMIT {int(limit)}' if limit else ''
+        res = await conn.execute(
+            f"""
+            UPDATE activity_tasks
+            SET status = 'pending', attempts = 0, worker_id = NULL,
+                lease_until = NULL, updated_at = now()
+            WHERE event_id IN (
+                SELECT event_id FROM activity_tasks
+                WHERE status = 'failed'
+                ORDER BY updated_at
+                {lim}
+            )
+            """
+        )
+        return int(res.split()[-1]) if res else 0
 
     return await execute_with_retry(_do)
 

@@ -10,7 +10,7 @@ copy .env.example .env            # 首次：填 PostgreSQL 连接信息
 python poly.py                    # 唯一入口：建库 → 代理池配置 → mihomo 实例 → events → N 个 worker
 ```
 
-`python poly.py` 幂等可反复跑；Ctrl+C 一次全停（worker + 本次启动的 mihomo 实例）；`python poly.py status` 看状态，`python poly.py stop` 清残留。详见下文《分布式多任务采集》。
+`python poly.py` 幂等可反复跑；Ctrl+C 一次全停（worker + 本次启动的 mihomo 实例）；`python poly.py status` 看状态，`python poly.py stop` 清残留，`python poly.py retry-failed` 死信重新入队。worker 异常重启、实例掉线自愈、日志落盘与心跳见下文《稳定性与自愈》；长期无人值守可另跑 `watchdog_poly.py`（poly 进程被强杀/机器重启后自动拉起）。
 
 ## 数据架构
 
@@ -31,7 +31,8 @@ python poly.py                    # 唯一入口：建库 → 代理池配置 �
 
 ```
 ploymarket/
-├── poly.py                 # ★ 统一入口：run（一键跑起来）/ status / stop
+├── poly.py                 # ★ 统一入口：run（一键跑起来）/ status / stop / retry-failed
+├── watchdog_poly.py        # poly 进程意外退出后自动拉起（无人值守兜底；人工 stop 过的不拉）
 ├── main_collect.py         # 全模块采集 CLI（initdb/stats/events/details/comments/
 │                           #   holders/positions/activity/prices/orderbook/all）
 ├── worker_activity.py      # 分布式 worker（领任务→采集→写库；poly 同进程并发 N 个）
@@ -134,8 +135,9 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 
 ```powershell
 python poly.py            # 一键跑起来（幂等，反复跑不会重复起）
-python poly.py status     # 状态：DB 统计 / 实例端口 / poly 主进程
-python poly.py stop       # 清残留：停掉 poly 启动的 mihomo 实例
+python poly.py status     # 状态：DB 统计（含死信数）/ 实例与 controller / poly 主进程
+python poly.py stop       # 清残留：停掉全部 mihomo 实例（含端口兜底），并记停止标记
+python poly.py retry-failed   # 死信（failed）重新入队（--limit N 限制条数）
 ```
 
 `poly.py` 的 run 流程（每步先检查现状再动作）：
@@ -144,13 +146,14 @@ python poly.py stop       # 清残留：停掉 poly 启动的 mihomo 实例
 |---|---|
 | [1/5] 建库建表 | `main_collect.py --stage initdb`（幂等） |
 | [2/5] 代理池配置 | `clash_worker/w1..wN.yaml` 缺失/无节点/内核未就位 → 自动生成（自动探测订阅与 mihomo 内核，`mihomo*.zip` 自动解压） |
-| [3/5] 实例 | 后台无窗口起 N 个 mihomo（日志 `clash_worker/mihomo-wN.log`），端口已在监听的直接复用 |
+| [3/5] 实例 | 后台无窗口起 N 个 mihomo（日志 `clash_worker/mihomo-wN.log`）；已监听且 controller/secret/节点组校验通过才复用，否则清掉残留重建 |
 | [4/5] 事件数据 | `events` 表为空 → 自动采集（经 w1 实例出口）；已非空则跳过 |
 | [5/5] worker | 同进程并发 N 个 worker（日志带 `[w1]`/`[w2]` 前缀），后台每 60 秒自动把 events 灌入任务队列 |
 
 - Ctrl+C **一次全停**（worker + 本次启动的 mihomo 实例）；关窗口/强杀后用 `python poly.py stop` 清残留实例
 - events 补采后**不需要重启 worker**：队列每 60s 自动补充（幂等）
 - worker 启动时会把 `scrape_progress` 里已完成的 activity 断点单向迁移进任务队列
+- 日志落盘：全部日志进 `logs/poly.log`，每个 worker 另有分文件 `logs/w1.log`…（含 clash_pool 的换节点日志，能查到"谁在什么时候换了节点"）
 
 ```powershell
 python poly.py                        # 部署 / 日常重启都用它
@@ -201,6 +204,50 @@ python make_worker_clash.py --n 3
 - mihomo 内核探测顺序：项目目录 `mihomo*.zip`（自动解压到 `mihomo_core/`）→ `clash_worker/mihomo*.exe` → `mihomo_core/mihomo*.exe` → 本机快安 / Clash Verge 自带内核；也可手动把内核 exe 放进前两个目录
 - 节点池越大越好：死节点自动跳过（短冷却 5 分钟），被限流节点/出口 IP 冷却 15 分钟
 
+### 稳定性与自愈（无人值守）
+
+长跑不看窗口也不会静默减员，每种故障都有日志可查：
+
+| 故障 | 系统行为 | 日志长什么样 |
+|---|---|---|
+| worker 异常退出 | 指数退避自动重启（5s→…→60s 封顶），不静默少一个 worker | `[poly] w2 异常退出（第 1 次: ...），5s 后自动重启` |
+| 领取任务时 DB 抖动 | 退避重试，worker 循环不退出（DB 层另有 4 次带连接池重建的重试） | `[w2] 领取任务失败（DB 抖动？...），2s 后重试` |
+| 代理实例掉线 | worker 暂停领新任务（在采事件继续采完，不白烧成死信），实例恢复自动继续 | `[w2] 代理实例不可用…暂停领新任务` / `…已恢复，继续领任务` |
+| mihomo 实例挂了 | poly 每 30s 巡检（端口 + controller 双重校验），自动清理重启并确认恢复 | `[poly] 实例 w2 掉线（mixed 7902 / ctl 9102）→ 自动重启` / `实例 w2 已恢复（pid …）` |
+| controller 不可用 | 节点轮换不拉黑节点（否则实例恢复后仍被冷却挡住），暂停 30s 再试 | `clash_pool: controller 不可用（…），暂停 30 秒后再试切换` |
+| 启动时旧实例残留 | 不只查端口：controller/secret/节点组校验不通过自动清掉重建 | `w2: controller 不可用（旧实例 / secret 不匹配）→ 清理残留并重建` |
+| 死信（failed） | 不自动重试（先查原因），数量变化时告警；确认后用 `retry-failed` 重新入队 | `注意: 队列有 N 个死信（failed），确认原因后: python poly.py retry-failed` |
+| 整个 poly 进程没了 | `watchdog_poly.py` 兜底拉起（人工 stop 过的不拉） | `logs/watchdog.log` |
+
+心跳（每 5 分钟一条，一眼判断系统是否活着）：
+
+```
+19:42:37 INFO [poly] 心跳: 实例 3/3 | 队列 pending=0 running=0 done=88 failed=0
+```
+
+死信处理（不自动回队：先看 `last_error` 和 `logs/wN.log` 确认原因）：
+
+```powershell
+python poly.py status              # failed 数量 > 0 会直接提示
+python poly.py retry-failed        # 全部重新入队（--limit N 限制条数）
+```
+
+### 无人值守（watchdog_poly.py，可选）
+
+poly 进程本身被强杀 / OOM / 机器重启后，由看门狗把它拉起来：
+
+```powershell
+python watchdog_poly.py                        # 常驻（每 60s 检查一次）
+python watchdog_poly.py --once                 # 只检查一次（适合注册计划任务/启动项）
+python watchdog_poly.py --n 3 --jobs 3         # 拉起时透传给 poly 的参数
+```
+
+- 判定规则：PID 记录里 poly 活着 → 不动；`clash_worker/.poly_stopped` 存在（`poly.py stop` / 正常 Ctrl+C 会写）→ 不动；都没有 → 拉起
+- 想恢复自动拉起：手动 `python poly.py` 启动一次即可（run 会清除停止标记）
+- 日志：看门狗 `logs/watchdog.log`；被拉起的 poly 输出 → `logs/poly-stdout.log`
+- 连续拉起失败指数退避（最长 30 分钟一次），配置错误时不会刷屏空转
+- 它只兜“整个进程没了”这一层；实例/worker 级别自愈由 poly.py 自己负责
+
 ### 状态监控
 
 ```sql
@@ -212,8 +259,7 @@ SELECT event_id, worker_id, lease_until, attempts FROM activity_tasks WHERE stat
 -- 排查失败原因
 SELECT event_id, attempts, last_error FROM activity_tasks WHERE status = 'failed';
 
--- 失败任务重新入队（人工排查后）
-UPDATE activity_tasks SET status = 'pending', attempts = 0 WHERE status = 'failed';
+-- 失败任务重新入队（人工排查后）：python poly.py retry-failed（等价，且会一并清理 worker_id/租约）
 ```
 
 ### 注意事项
@@ -221,4 +267,4 @@ UPDATE activity_tasks SET status = 'pending', attempts = 0 WHERE status = 'faile
 1. **不要混跑**：worker 模式与 `main_collect.py --stage activity` 单机模式使用不同进度表（`activity_tasks` vs `scrape_progress`），同时跑会重复采集（幂等不脏数据，但浪费配额）。worker 启动时会把 `scrape_progress` 中已完成的 done 断点**单向迁移**进任务队列
 2. **代理要求**：每个 worker 一个独立出口 IP（独立隧道代理端口，或 mihomo 代理池模式下的专属实例）；多个 worker 共用同一出口 IP 无扩展效果（限流共享）
 3. **jobs 建议 2-4**：单 IP 配额 200 req/10s，jobs 过大只是排队
-4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；`poly.py` 模式下 Ctrl+C 会同时停掉本次启动的 mihomo 实例。强杀/关窗口场景租约超时（默认 15 分钟）自动回收任务，mihomo 残留用 `python poly.py stop` 清理
+4. **优雅退出**：Ctrl+C 停止领新任务、等在采事件完成；`poly.py` 模式下 Ctrl+C 会同时停掉本次启动的 mihomo 实例。强杀/关窗口场景租约超时（默认 15 分钟）自动回收任务，mihomo 残留用 `python poly.py stop` 清理；整机重启/进程被杀后的自动拉起用 `watchdog_poly.py`（见《无人值守》）

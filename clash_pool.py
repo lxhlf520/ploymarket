@@ -320,6 +320,11 @@ class AsyncNodeRotator:
     async def _rotate_locked(self, reason: str):
         """轮询选下一个可用节点（调用方须已持锁）"""
         now = time.time()
+        # controller 不可用（实例挂了/重启中）：先不拉黑节点，否则实例恢复后仍被冷却挡住
+        if not await self.api.alive():
+            self.pause_until = now + 30
+            logger.warning('controller 不可用（%s），暂停 30 秒后再试切换', self.api.base)
+            return
         # 清理已过期的 ban 记录，防止字典无限膨胀
         expired_nodes = [k for k, v in self.banned_nodes.items() if v <= now]
         for k in expired_nodes:
