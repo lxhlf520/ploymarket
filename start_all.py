@@ -153,6 +153,7 @@ def step_events(dry: bool, skip: bool) -> None:
         return
     log(f'      events 表 {cnt} 行')
     if cnt:
+        log('      已非空，跳过（如需补全/更新请单独跑: python main_collect.py --stage events）')
         return
     log('      events 为空 → 自动采集 Gamma 事件（走代理池；可能较久，Ctrl+C 可中断、重跑续采）')
     if dry:
