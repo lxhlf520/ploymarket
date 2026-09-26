@@ -553,6 +553,23 @@ async def reset_pool() -> None:
         _pool = None
 
 
+async def _expire_idle_connections() -> None:
+    """关闭池中所有空闲连接（清掉可能已被 PG 集群代理掐断的半死连接）。
+
+    半死连接（服务端已断、客户端未感知）留在池里会被反复取用，每次都要等
+    TCP 超时才报错；清掉后下次 acquire 直接建新连接。asyncpg 0.30+ 才支持
+    expire_connections，旧版静默跳过（行为与之前一致）。
+    """
+    pool = _pool
+    expire = getattr(pool, 'expire_connections', None)
+    if pool is None or expire is None:
+        return
+    try:
+        await expire()
+    except Exception as exc:
+        logger.debug('清理空闲连接失败（忽略）: %s', exc)
+
+
 # 可重试的瞬时故障：池内连接失效 / PG 重启中 / 网络抖动
 RETRYABLE_DB_ERRORS = (
     asyncpg.exceptions.InterfaceError,               # 池内连接已被回收
@@ -563,13 +580,28 @@ RETRYABLE_DB_ERRORS = (
     ConnectionRefusedError,
 )
 
+# 明确的 PG 连接层故障（集群代理掐连 / PG 重启 / 网络抖动）：
+# 任务因这类错误失败时不消耗 attempts、不进死信，直接回队重试
+DB_CONN_LOST_ERRORS = (
+    asyncpg.exceptions.InterfaceError,               # 含 ConnectionDoesNotExistError 子类
+    asyncpg.exceptions.ConnectionDoesNotExistError,  # 连接在操作中途被断
+    asyncpg.exceptions.ConnectionFailureError,
+    asyncpg.exceptions.CannotConnectNowError,
+)
 
-async def execute_with_retry(coro_fn, *args, max_attempts: int = 4, **kwargs):
-    """执行 DB 操作；瞬时故障（池损坏 / PG 重启 / 网络抖动）退避重试后再放弃。
+
+def is_db_conn_error(exc: BaseException) -> bool:
+    """异常是否为 PG 连接层瞬时故障（供 worker 区分「基础设施抖动」与「真失败」）"""
+    return isinstance(exc, DB_CONN_LOST_ERRORS)
+
+
+async def execute_with_retry(coro_fn, *args, max_attempts: int = 6, **kwargs):
+    """执行 DB 操作；瞬时故障（池损坏 / PG 集群代理掐连 / 网络抖动）退避重试后再放弃。
 
     长驻采集循环依赖这里兜住抖动：单次抖动不能让 worker 退出。
     - InterfaceError：池内连接已被回收，重建池再试
-    - 连接类错误：等退避后重试，池内死连接由 asyncpg 自行替换（不重建池，避免影响并发调用方）
+    - 连接类错误：先清掉池中空闲的半死连接再退避重试
+      （PG 集群代理容易掐连，半死连接留在池里会被反复取到、每次白等 TCP 超时）
     """
     delay = 1.0
     last_exc = None
@@ -591,6 +623,7 @@ async def execute_with_retry(coro_fn, *args, max_attempts: int = 4, **kwargs):
             else:
                 logger.warning('DB 瞬时故障（%s），%.1fs 后重试（第 %d/%d 次）: %s',
                                type(exc).__name__, delay, attempt, max_attempts, exc)
+                await _expire_idle_connections()
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 15)
     raise last_exc
@@ -1191,9 +1224,27 @@ async def complete_activity_task(event_id: str, rows: int) -> None:
     await execute_with_retry(_do)
 
 
-async def fail_activity_task(event_id: str, err: str, max_attempts: int = 5) -> str:
-    """任务失败：attempts+1；达上限标 failed（死信），否则回 pending 待重试。返回新状态"""
+async def fail_activity_task(event_id: str, err: str, max_attempts: int = 5,
+                             transient: bool = False) -> str:
+    """任务失败：attempts+1；达上限标 failed（死信），否则回 pending 待重试。返回新状态
+
+    transient=True（PG 连接层抖动）：撤销本次领取的 attempts+1 并无条件回 pending，
+    不参与死信判定——基础设施抖动不该消耗任务自身的重试机会。
+    """
     async def _do(conn):
+        if transient:
+            return await conn.fetchval(
+                """
+                UPDATE activity_tasks
+                SET attempts = GREATEST(attempts - 1, 0),
+                    last_error = left($2, 500),
+                    status = 'pending',
+                    worker_id = NULL, lease_until = NULL, updated_at = now()
+                WHERE event_id = $1
+                RETURNING status
+                """,
+                event_id, err,
+            )
         return await conn.fetchval(
             """
             UPDATE activity_tasks

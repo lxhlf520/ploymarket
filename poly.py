@@ -70,6 +70,8 @@ EVENTS_PROXY = f'http://127.0.0.1:{MIXED_START}'
 WORKERS = 3
 JOBS = 3
 REFILL_INTERVAL = 60       # 自动补任务队列间隔（秒）
+EVENTS_RETRY = 3           # events 采集失败后的自动重试次数（断点续采，重跑幂等）
+EVENTS_RETRY_DELAY = 30    # events 采集失败重试的首次等待（秒，之后翻倍）
 MONITOR_INTERVAL = 30      # 实例健康巡检间隔（秒）
 HEARTBEAT_INTERVAL = 300   # 运行心跳日志间隔（秒）
 WORKER_RESTART_MIN = 5     # worker 异常重启最小间隔（秒）
@@ -448,8 +450,24 @@ def step_events(dry: bool, no_events: bool, force: int = None) -> None:
     env = dict(os.environ)
     env.setdefault('HTTPS_PROXY', EVENTS_PROXY)
     env.setdefault('HTTP_PROXY', EVENTS_PROXY)
-    if _run(cmd, env=env) != 0:
-        log('      警告: events 采集未正常结束（重跑 python poly.py 会续采）')
+    # 采集失败自动重试：Stage A/B 均有 set_scope_state 断点，重跑只续采不重复；
+    # DB/PG 集群代理抖动导致的异常退出靠这里兜住，避免人工重跑 poly.py
+    delay = EVENTS_RETRY_DELAY
+    for attempt in range(EVENTS_RETRY + 1):
+        rc = _run(cmd, env=env)
+        if rc == 0:
+            break
+        if rc in (130, 3221225786):    # Ctrl+C（POSIX 130 / Windows 0xC000013A）
+            log('      采集被中断，退出（进度已入库，重跑 python poly.py 续采）')
+            break
+        if attempt < EVENTS_RETRY:
+            log(f'      采集异常退出（rc={rc}），{delay}s 后自动重试'
+                f'（第 {attempt + 1}/{EVENTS_RETRY} 次；断点续采，不会重复采）')
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+        else:
+            log(f'      采集重试 {EVENTS_RETRY} 次仍未正常结束；'
+                '重跑 python poly.py 会继续续采（进度已入库）')
 
 
 async def _task_stats() -> dict:

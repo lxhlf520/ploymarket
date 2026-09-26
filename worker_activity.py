@@ -151,10 +151,20 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
                         pbar.set_postfix(rows=worker_rows, done=worker_done)
                     log.info('事件 %s 完成: %s 行 (ins=%s upd=%s)', eid, total, ins, upd)
                 except Exception as exc:
-                    status = await db_pg.fail_activity_task(eid, str(exc), max_attempts)
+                    transient = db_pg.is_db_conn_error(exc)
+                    try:
+                        status = await db_pg.fail_activity_task(
+                            eid, str(exc), max_attempts, transient=transient)
+                    except Exception as fexc:
+                        # DB 彻底不可用：任务留在 running，等租约过期后会被重新领取
+                        status = '退避中'
+                        log.error('事件 %s 回写失败状态也失败（DB 不可用）: %s', eid, fexc)
                     if pbar:
                         pbar.update(1)
-                    log.warning('事件 %s 失败 (第%s次→%s): %s', eid, attempts, status, exc)
+                    if transient:
+                        log.warning('事件 %s 失败（PG 连接抖动，不计次直接回队）: %s', eid, exc)
+                    else:
+                        log.warning('事件 %s 失败 (第%s次→%s): %s', eid, attempts, status, exc)
 
             next_stats = time.monotonic() + STATS_INTERVAL
             proxy_ok = True              # 代理实例存活门禁（掉线时暂停领新任务）
