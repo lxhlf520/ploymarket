@@ -7,7 +7,11 @@ REM Prereq: python make_worker_clash.py --n 3   (generates clash_worker\*.yaml)
 cd /d %~dp0
 
 REM 1) start mihomo instances (w1: mixed 7901 / controller 9101, ...)
+REM    note: start_mihomo.bat cd's into clash_worker\ and call shares THIS shell's
+REM    cwd -- restore it, otherwise the worker windows below start in clash_worker\
+REM    and fail with "can't open file worker_activity.py"
 call clash_worker\start_mihomo.bat
+cd /d %~dp0
 timeout /t 3 /nobreak >nul
 
 REM 2) start workers, each bound to its own instance

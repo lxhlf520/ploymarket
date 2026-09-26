@@ -129,9 +129,12 @@ def main():
         lines.append(f'set CORE={core}')
     else:
         lines.append('set CORE=CHANGE_ME_to_mihomo.exe')
-    lines.append('cd /d %~dp0')
+    # pushd/popd：~dp0 切目录后必须恢复，否则被 call 时会把调用者的 cwd
+    # 也留在 clash_worker\（start_workers.bat 在同一 cmd 会话里）
+    lines.append('pushd %~dp0')
     for i, _mixed, _ctl in starts:
         lines.append(f'start "pm-mihomo-w{i}" /min cmd /c "%CORE% -f w{i}.yaml"')
+    lines.append('popd')
     lines += ['echo.', 'echo mihomo instances started:',
               *[f'echo   w{i}: mixed={m} controller={c}' for i, m, c in starts]]
     with open(os.path.join(out_dir, 'start_mihomo.bat'), 'w', encoding='gbk',
