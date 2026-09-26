@@ -52,22 +52,52 @@ ploymarket/
 ├── export_cookie.py        # 导出登录态 cookie（comments 需要）
 ├── condition_ids.txt       # 市场种子（65k+ conditionId，Phase A 数据源）
 ├── requirements.txt
-└── .env.example            # 数据库配置模板（复制为 .env 后填写）
+├── .env.example            # 数据库配置模板（复制为 .env 后填写）
+├── clash_config.yaml       # 机场订阅（手动放入，不入库，见《新机器部署》）
+├── mihomo_core/            # mihomo 内核（手动放入，不入库；或放 mihomo.zip 首次运行自动解压）
+└── logs/                   # 运行日志（poly.log / w1..wN.log / watchdog.log）
 ```
 
 ## 环境要求
 
+- **Windows 10/11**：`poly.py` 的实例管理依赖 `tasklist` / `taskkill` / `netstat` / `winreg`，当前仅支持 Windows
 - Python 3.10+（开发环境 3.12）
-- PostgreSQL 15+（建议空闲磁盘 ≥ 40GB，全量数据 20-40GB）
+- PostgreSQL 15+（建议空闲磁盘 ≥ 40GB，全量数据 20-40GB；不需要任何扩展）
 - 网络可达 `data-api.polymarket.com` 与 Polygon RPC 节点
 
-## 安装
+## 新机器部署
 
-```bash
+```powershell
+# 1. 拉代码
 git clone https://github.com/lxhlf520/ploymarket.git
 cd ploymarket
+
+# 2. 装依赖
 pip install -r requirements.txt
+
+# 3. 拷 3 个 git 之外的文件（见下表），并把 .env 的 PG_PASSWORD 改成新机器的密码
+
+# 4. 自检：只打印不落库/不启实例（PG 连通 / 订阅解析 / 内核探测）
+python poly.py --dry-run
+
+# 5. 正式跑：建库 → 代理池配置 → mihomo 实例 → events → N 个 worker
+python poly.py
 ```
+
+### 需要手动拷贝的文件（都不在 git 里）
+
+| 文件 | 放到 | 必需性 | 说明 |
+|---|---|---|---|
+| `.env` | `ploymarket/.env` | **必需** | 从旧机器拷贝或按 `.env.example` 新建；`PG_PASSWORD` 必须是**新机器**的 PostgreSQL 密码 |
+| `clash_config.yaml` | `ploymarket/clash_config.yaml` | **必需** | 机场订阅（含节点凭据，敏感不入库）；poly 按此路径自动探测，放根目录最省事 |
+| mihomo 内核 | `ploymarket/mihomo_core/mihomo-windows-amd64.exe` | **必需** | 直接拷 `mihomo_core/` 整个目录；或只拷 `mihomo.zip` 到根目录，首次运行自动解压；机器上装有快安/Clash Verge 也可兜底 |
+| `cookies.json` | `ploymarket/cookies.json` | 可选 | 仅 `main_collect.py` 采集评论需要；可在新机器 `python export_cookie.py --json "{...}"` 重新导出 |
+
+**不需要拷**：`clash_worker/`（首次运行自动生成 w1..wN.yaml 与实例配置）、`logs/`、`__pycache__/`、`condition_ids.txt`（已在仓库）。
+
+### 部署自检
+
+`python poly.py status` 显示「实例可用 3/3」；日志出现 `[poly] 心跳: 实例 3/3 | 队列 ...`；`python poly.py stop` 后 6 个端口（7901-7903 / 9101-9103）全部关闭。
 
 ## 数据库配置
 
@@ -77,6 +107,8 @@ cp .env.example .env     # Windows: copy .env.example .env
 ```
 
 `.env` 中的同名环境变量优先于 `config.py` 默认值，密码不会硬编码进代码。也可以不建 `.env`，直接在启动环境中 export 这些变量。
+
+`python poly.py` 首次运行会自动 `CREATE DATABASE` 并建表，要求 `.env` 中的用户有建库权限（postgres 超级用户即可）。
 
 ## 初始化（幂等）
 
