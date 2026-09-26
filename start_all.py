@@ -6,6 +6,8 @@
     python start_all.py                 # 全流程（首次部署 / 日常重启都用它）
     python start_all.py --n 3 --jobs 3  # 实例数 / 每 worker 并发（默认 3 / 3）
     python start_all.py --dry-run       # 只检查并打印将执行的动作，不实际执行
+    python start_all.py --collect-events 2   # 试跑：强制先小量采 2 个事件
+    python start_all.py --collect-events     # 非空后补全：强制重采 events（全量）
     python start_all.py --skip-events   # 跳过事件检查（确认队列已有数据时）
     python start_all.py --workers-only  # 只起 worker（代理池与数据已就绪）
 
@@ -141,7 +143,7 @@ async def _count_events() -> int:
     return await db_pg.execute_with_retry(_do)
 
 
-def step_events(dry: bool, skip: bool) -> None:
+def step_events(dry: bool, skip: bool, force: int = None) -> None:
     log('[4/5] 事件数据检查（worker 任务队列的数据源）')
     if skip:
         log('      --skip-events，跳过')
@@ -152,17 +154,24 @@ def step_events(dry: bool, skip: bool) -> None:
         log(f'      查询 events 失败（{type(exc).__name__}: {exc}）→ 请先完成 initdb')
         return
     log(f'      events 表 {cnt} 行')
-    if cnt:
-        log('      已非空，跳过（如需补全/更新请单独跑: python main_collect.py --stage events）')
+    if cnt and force is None:
+        log('      已非空，跳过（如需补全/更新: python start_all.py --collect-events）')
         return
-    log('      events 为空 → 自动采集 Gamma 事件（走代理池；可能较久，Ctrl+C 可中断、重跑续采）')
+    lim = force or 0       # None/0 → 全量；N>0 → 只采 N 个
+    cmd = [PY, 'main_collect.py', '--stage', 'events'] \
+        + (['--limit', str(lim)] if lim else [])
+    shown = ' '.join(cmd[1:])
     if dry:
-        log('      → python main_collect.py --stage events')
+        log(f'      → {shown}')
         return
+    if cnt:
+        log(f'      --collect-events 指定 → 强制采集（{shown}）')
+    else:
+        log(f'      events 为空 → 自动采集（{shown}；可能较久，Ctrl+C 可中断、重跑续采）')
     env = dict(os.environ)
     env.setdefault('HTTPS_PROXY', EVENTS_PROXY)
     env.setdefault('HTTP_PROXY', EVENTS_PROXY)
-    if run([PY, 'main_collect.py', '--stage', 'events'], env=env) != 0:
+    if run(cmd, env=env) != 0:
         log('      警告: events 采集未正常结束（可重跑本脚本续采）')
 
 
@@ -193,6 +202,9 @@ def main() -> None:
     parser.add_argument('--jobs', type=int, default=3, help='每 worker 并发事件数（默认 3）')
     parser.add_argument('--dry-run', action='store_true', help='只检查并打印将执行的动作')
     parser.add_argument('--skip-events', action='store_true', help='跳过事件数据检查')
+    parser.add_argument('--collect-events', nargs='?', type=int, const=0, default=None,
+                        metavar='N',
+                        help='强制采集 events（可跟数量如 --collect-events 2 试跑；不带数量=全量补全）')
     parser.add_argument('--workers-only', action='store_true', help='只起 worker（跳过 1-4 步）')
     args = parser.parse_args()
 
@@ -201,7 +213,7 @@ def main() -> None:
         step_initdb(args.dry_run)
         step_clash(args.n, args.dry_run)
         step_mihomo(args.n, args.dry_run)
-        step_events(args.dry_run, args.skip_events)
+        step_events(args.dry_run, args.skip_events, args.collect_events)
     step_workers(args.n, args.jobs, args.dry_run)
     log('完成（%.1fs）。停止: worker 窗口 Ctrl+C；实例 clash_worker\\stop_mihomo.bat'
         % (time.time() - t0))

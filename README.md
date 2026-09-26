@@ -111,6 +111,7 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 ```bash
 python start_all.py            # 幂等全流程：initdb → 代理池（自动探测订阅/内核）→ events（空则采）→ 起 N 个 worker
 python start_all.py --dry-run  # 先空跑检查：只打印将执行的动作
+python start_all.py --collect-events 2   # 试跑：强制先小量采 2 个事件验证链路（不带数字=全量补采）
 ```
 
 每步幂等、可反复跑；worker 启动时自动把 `events` 灌入任务队列（`activity_tasks`）——首次部署和日常重启都用它。
