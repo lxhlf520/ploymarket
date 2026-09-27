@@ -583,7 +583,7 @@ RETRYABLE_DB_ERRORS = (
 # 明确的 PG 连接层故障（集群代理掐连 / PG 重启 / 网络抖动）：
 # 任务因这类错误失败时不消耗 attempts、不进死信，直接回队重试
 DB_CONN_LOST_ERRORS = (
-    asyncpg.exceptions.InterfaceError,               # 含 ConnectionDoesNotExistError 子类
+    asyncpg.exceptions.InterfaceError,               # 池/驱动接口层错误（与 PostgresConnectionError 体系无关）
     asyncpg.exceptions.ConnectionDoesNotExistError,  # 连接在操作中途被断
     asyncpg.exceptions.ConnectionFailureError,
     asyncpg.exceptions.CannotConnectNowError,
