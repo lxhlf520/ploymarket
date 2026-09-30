@@ -6,14 +6,12 @@
 - 领取：claim_activity_task 原子领取（FOR UPDATE SKIP LOCKED），多 worker 并发不重复
 - 租约：running 超时自动回收——worker 被强杀后其任务由其他 worker 接管
 - 出口：经 --proxy 走独立隧道代理（独立出口 IP → 独立 200 req/10s 限流配额）
-- 限流自动切节点（可选）：--clash-base 指向 worker 专用 mihomo 实例的 controller，
-  429 累计 3 次/403 → ban 当前节点与出口 IP → 自动切下一节点继续采集
 
 统一入口（推荐，不用直接运行本文件）：
     python poly.py            # 一键：实例 + events + 多 worker（日志 [w1]/[w2] 前缀）
     python poly.py status     # 看状态
 单实例调试仍可用：
-    python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1
+    python worker_activity.py --proxy http://127.0.0.1:7899 --worker-id w1
     python worker_activity.py --idle-wait 0          # 队列空即退出（一次性模式）
 
 注意：与 main_collect.py --stage activity 单机模式不要混跑（进度表互相隔离，
@@ -22,7 +20,6 @@ worker 初始化时会把 scrape_progress 的 done 单向迁移进任务队列�
 
 import argparse
 import asyncio
-import contextlib
 import contextvars
 import logging
 import os
@@ -33,7 +30,6 @@ import urllib.parse
 from tqdm import tqdm
 
 import config
-import clash_pool
 import db_pg
 import scraper_data
 from data_api_client import DataAPIClient, TokenBucket
@@ -43,7 +39,6 @@ logger = logging.getLogger('polymarket_worker')
 STATS_INTERVAL = 30       # 队列统计打印间隔（秒）
 PROXY_CHECK_INTERVAL = 5  # 代理实例端口探测间隔（秒）
 DB_BACKOFF_MAX = 30       # DB 瞬时故障退避上限（秒）
-ROTATOR_INIT_RETRY = 3    # 轮换器初始化重试次数（实例刚重启时别急着降级为静态代理）
 
 # 当前 worker 标识（poly.py 按它把日志分流到 logs/wN.log；单实例 CLI 下同样有值）
 CURRENT_WORKER = contextvars.ContextVar('polymarket_worker_id', default=None)
@@ -59,7 +54,7 @@ class _Prefixed(logging.LoggerAdapter):
 def _proxy_up(proxy: str) -> bool:
     """本机代理端口探测（poly 启的 mihomo 实例）：实例掉线时暂停领任务，避免把事件烧成死信。
 
-    远程/隧道代理无法端口探测，一律按可用处理（连接级失败交给请求重试与节点轮换）。
+    远程/隧道代理无法端口探测，一律按可用处理（连接级失败交给请求重试退避）。
     """
     if not proxy:
         return True
@@ -75,11 +70,9 @@ def _proxy_up(proxy: str) -> bool:
         return s.connect_ex((host, port)) == 0
 
 
-async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: str = None,
-                     clash_secret: str = 'pm-worker', clash_group: str = 'PM',
+async def run_worker(worker_id: str = None, *, proxy: str = None,
                      jobs: int = 3, lease_min: int = 15, max_attempts: int = 5,
-                     idle_wait: int = 30, rotate_after: int = 150,
-                     max_delay: int = 10000, progress: bool = True) -> dict:
+                     idle_wait: int = 30, progress: bool = True) -> dict:
     """单 worker 采集循环（供 poly.py 同进程并发多实例，或 CLI 单实例）
 
     idle_wait=0 时队列空即返回；返回 {'done': 完成事件数, 'rows': 采集行数}
@@ -99,32 +92,9 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
                     type(exc).__name__, exc)
         init = {'stats': '(查询失败)'}
 
-    # 节点轮换器：--clash-base 指向 worker 专用 mihomo 实例时启用
-    rotator = None
-    if clash_base:
-        api = clash_pool.ClashAPI(base=clash_base, secret=clash_secret,
-                                  group=clash_group, mixed=proxy)
-        rotator = clash_pool.AsyncNodeRotator(api, rotate_after=rotate_after,
-                                              max_delay_ms=max_delay)
-        ok = False
-        for attempt in range(1, ROTATOR_INIT_RETRY + 1):
-            ok = await rotator.load_nodes()
-            if ok or attempt == ROTATOR_INIT_RETRY:
-                break
-            log.warning('节点轮换初始化失败（第 %d/%d 次），10 秒后重试',
-                        attempt, ROTATOR_INIT_RETRY)
-            await asyncio.sleep(10)
-        if ok:
-            await rotator.start_health_check()
-        else:
-            log.warning('节点轮换不可用（controller 不通/组无节点），退化为静态代理')
-            with contextlib.suppress(BaseException):
-                await api.close()
-            rotator = None
-
-    log.info('worker 启动 (proxy=%s, jobs=%s, rotate=%s) 队列初始: %s',
+    log.info('worker 启动 (proxy=%s, jobs=%s) 队列初始: %s',
              proxy or (f'系统代理 {config.SYSTEM_PROXY}' if config.SYSTEM_PROXY else '直连'),
-             jobs, f'{len(rotator.nodes)}节点' if rotator else '关', init['stats'])
+             jobs, init['stats'])
 
     bucket = TokenBucket(capacity=config.TRADES_RATE_LIMIT)
     worker_done = 0
@@ -133,10 +103,7 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
     running = set()          # 进行中的采集协程
 
     try:
-        async with DataAPIClient(
-                bucket=bucket, proxy=proxy,
-                on_request=rotator.on_request if rotator else None,
-                on_rate_limited=rotator.on_rate_limited if rotator else None) as api:
+        async with DataAPIClient(bucket=bucket, proxy=proxy) as api:
 
             async def job(eid: str, attempts: int) -> None:
                 """领取后的事件采集任务：成功标 done，失败按 attempts 回 pending 或死信"""
@@ -243,11 +210,6 @@ async def run_worker(worker_id: str = None, *, proxy: str = None, clash_base: st
     finally:
         if pbar:
             pbar.close()
-        if rotator:
-            with contextlib.suppress(BaseException):
-                await rotator.stop_health_check()
-            with contextlib.suppress(BaseException):
-                await rotator.api.close()
     return {'done': worker_done, 'rows': worker_rows}
 
 
@@ -265,17 +227,6 @@ def parse_args():
                         help='单事件最大尝试次数，超过标 failed 死信（默认 5）')
     parser.add_argument('--idle-wait', type=int, default=30,
                         help='队列空时轮询间隔秒（默认 30；0=队列空即退出）')
-    parser.add_argument('--clash-base', default=None,
-                        help='mihomo controller 地址（如 http://127.0.0.1:9101）；'
-                             '配置后启用限流自动切节点（需 --proxy 指向同一实例 mixed 端口）')
-    parser.add_argument('--clash-secret', default='pm-worker',
-                        help='mihomo external-controller secret（默认 pm-worker）')
-    parser.add_argument('--clash-group', default='PM',
-                        help='mihomo selector 组名（默认 PM）')
-    parser.add_argument('--rotate-after', type=int, default=150,
-                        help='每 N 次请求主动轮换节点（默认 150；0=仅限流时切换）')
-    parser.add_argument('--max-delay', type=int, default=10000,
-                        help='节点预筛延迟上限(ms)，超过则跳过（默认 10000）')
     return parser.parse_args()
 
 
@@ -291,11 +242,9 @@ def main():
         raise SystemExit('--jobs 至少为 1')
     try:
         asyncio.run(run_worker(
-            args.worker_id, proxy=args.proxy, clash_base=args.clash_base,
-            clash_secret=args.clash_secret, clash_group=args.clash_group,
+            args.worker_id, proxy=args.proxy,
             jobs=args.jobs, lease_min=args.lease_min,
-            max_attempts=args.max_attempts, idle_wait=args.idle_wait,
-            rotate_after=args.rotate_after, max_delay=args.max_delay))
+            max_attempts=args.max_attempts, idle_wait=args.idle_wait))
     except KeyboardInterrupt:
         logger.info('worker 已退出')
 

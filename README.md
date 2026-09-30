@@ -37,7 +37,6 @@ ploymarket/
 │                           #   holders/positions/activity/prices/orderbook/all）
 ├── worker_activity.py      # 分布式 worker（领任务→采集→写库；poly 同进程并发 N 个）
 ├── make_worker_clash.py    # 代理池配置生成（订阅 → clash_worker/w1..N.yaml + 内核探测/解压）
-├── clash_pool.py           # mihomo 节点轮换器（429/403 自动切节点换出口 IP）
 ├── db_pg.py                # PostgreSQL 建库建表、批量 upsert、任务队列与进度管理
 ├── config.py               # 全部配置（数据库连接从 .env / 环境变量读取）
 ├── data_api_client.py      # Data API 客户端（限流/重试/翻页）
@@ -185,7 +184,7 @@ python poly.py retry-failed   # 死信（failed）重新入队（--limit N 限�
 - Ctrl+C **一次全停**（worker + 本次启动的 mihomo 实例）；关窗口/强杀后用 `python poly.py stop` 清残留实例
 - events 补采后**不需要重启 worker**：队列每 60s 自动补充（幂等）
 - worker 启动时会把 `scrape_progress` 里已完成的 activity 断点单向迁移进任务队列
-- 日志落盘：全部日志进 `logs/poly.log`，每个 worker 另有分文件 `logs/w1.log`…（含 clash_pool 的换节点日志，能查到"谁在什么时候换了节点"）
+- 日志落盘：全部日志进 `logs/poly.log`，每个 worker 另有分文件 `logs/w1.log`…
 
 ```powershell
 python poly.py                        # 部署 / 日常重启都用它
@@ -201,21 +200,18 @@ run 参数：`--n`（实例数=worker 数，默认 3）、`--jobs`（每 worker 
 单实例调试（不走 poly，手动指定代理或直连）：
 
 ```powershell
-python worker_activity.py --proxy http://127.0.0.1:7901 --clash-base http://127.0.0.1:9101 --worker-id w1 --jobs 3
+python worker_activity.py --proxy http://127.0.0.1:7899 --worker-id w1 --jobs 3
 python worker_activity.py --worker-id w4 --jobs 3   # 不填 --proxy = 直连
 ```
 
-worker 参数：`--proxy`、`--jobs`（默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）、`--rotate-after`（每 N 请求主动换节点，默认 150，0=仅限流时切换）、`--max-delay`（节点预筛延迟上限 ms，默认 10000）。
+worker 参数：`--proxy`、`--jobs`（默认 3）、`--lease-min`（租约分钟，默认 15）、`--max-attempts`（重试上限，默认 5，超过标 failed 死信）、`--idle-wait`（队列空轮询秒数，默认 30，0=领空即退出）。
 
-### 限流自动切节点（mihomo 代理池，推荐）
+### 隧道代理出口
 
-复用机场订阅，为每个 worker 起一个专属 mihomo(Clash.Meta) 实例（独立 mixed 端口 + 独立节点组），worker 内置节点轮换器（`clash_pool.AsyncNodeRotator`，移植自 glassdoor 项目实战经验）：
+worker 经 `--proxy` 走链式隧道（本地 chain_proxy → mihomo hop1 实例 → 青果海外隧道）：
 
-- **触发**：429 累计 3 次（防抖）/ 403 / 连接级错误（死节点）→ 自动切换
-- **切换逻辑**：ban 当前节点 + 出口 IP（冷却 15 分钟）→ 轮询组内下一可用节点（切不动/出口 IP 仍在冷却的自动跳过）→ 验证新出口 IP → 暂停 5 秒等生效 → 继续采集
-- **主动轮换**：每 150 次请求主动换一个 IP（`--rotate-after`，0=仅限流时切换），摊薄单 IP 请求量
-- **启动预筛**：实例就绪后先测一遍节点延迟，超过 `--max-delay`（默认 10000ms）的跳过，避免一上来撞死节点
-- 切换**无需重建 HTTP 客户端**：采集连接都走实例 mixed 端口，组切换后新请求自动走新节点
+- mihomo 实例由 `poly.py` 照常编排（配置生成/起停/巡检），仅作 hop1 出海哑管道，**节点固定使用，不做自动切换**（出口 IP 轮换由隧道代理每连接换 IP 承担）
+- 429/403 由 DataAPIClient 的既有重试退避处理，不再触发节点轮换
 
 配置生成与实例起停**全部由 `poly.py` 自动完成**（`clash_worker/` 下的 w1..wN.yaml 与 mihomo 实例都归它管）：
 
@@ -231,10 +227,8 @@ python make_worker_clash.py --n 3
 端口配对（w1 示例）：mixed `7901` ↔ controller `9101`，w2 → `7902`/`9102`，以此类推；controller secret 统一 `pm-worker`，节点组名 `PM`。
 
 说明：
-- `--clash-base` 指向该 worker 专属实例的 external-controller；不配则退化为静态 `--proxy`（行为不变）
 - `clash_worker/` 含机场节点凭据，已在 .gitignore 中排除，每台机器自行生成
 - mihomo 内核探测顺序：项目目录 `mihomo*.zip`（自动解压到 `mihomo_core/`）→ `clash_worker/mihomo*.exe` → `mihomo_core/mihomo*.exe` → 本机快安 / Clash Verge 自带内核；也可手动把内核 exe 放进前两个目录
-- 节点池越大越好：死节点自动跳过（短冷却 5 分钟），被限流节点/出口 IP 冷却 15 分钟
 
 ### 稳定性与自愈（无人值守）
 
@@ -249,7 +243,6 @@ python make_worker_clash.py --n 3
 | events 采集异常退出 | 自动重试 3 次（30s 起翻倍）；Stage A/B 断点续采不会重复，Ctrl+C 不重试 | `采集异常退出（rc=1），30s 后自动重试（第 1/3 次；断点续采，不会重复采）` |
 | 代理实例掉线 | worker 暂停领新任务（在采事件继续采完，不白烧成死信），实例恢复自动继续 | `[w2] 代理实例不可用…暂停领新任务` / `…已恢复，继续领任务` |
 | mihomo 实例挂了 | poly 每 30s 巡检（端口 + controller 双重校验），自动清理重启并确认恢复 | `[poly] 实例 w2 掉线（mixed 7902 / ctl 9102）→ 自动重启` / `实例 w2 已恢复（pid …）` |
-| controller 不可用 | 节点轮换不拉黑节点（否则实例恢复后仍被冷却挡住），暂停 30s 再试 | `clash_pool: controller 不可用（…），暂停 30 秒后再试切换` |
 | 启动时旧实例残留 | 不只查端口：controller/secret/节点组校验不通过自动清掉重建 | `w2: controller 不可用（旧实例 / secret 不匹配）→ 清理残留并重建` |
 | 死信（failed） | 不自动重试（先查原因），数量变化时告警；确认后用 `retry-failed` 重新入队 | `注意: 队列有 N 个死信（failed），确认原因后: python poly.py retry-failed` |
 | 整个 poly 进程没了 | `watchdog_poly.py` 兜底拉起（人工 stop 过的不拉） | `logs/watchdog.log` |

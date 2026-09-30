@@ -18,7 +18,7 @@ run 流程（每步先检查状态再动作，重复跑不会重复起）：
     - worker 异常退出 → 指数退避后自动重启（最多 60s 一次），不静默减员
     - 领任务时 DB 抖动 → 退避重试，worker 循环不退出（PG 重启/网络抖动由 db_pg 兜底）
     - 代理实例掉线 → worker 暂停领新任务（不把事件白烧成死信），poly 每 30s 巡检自动重启实例
-    - controller 不可用 → 节点轮换不拉黑节点，实例恢复后立即可切换
+    - mihomo 实例仅作链式隧道 hop1 出海通道（哑管道，不做节点切换）
     - 死信（failed）不自动重试但会醒目提醒，人工确认后用 retry-failed 重新入队
     - 心跳：每 5 分钟一条“实例 N/N | 队列 …”日志，日志落盘 logs/poly.log + logs/wN.log
 
@@ -568,8 +568,6 @@ async def _supervise(worker_id: str, mixed: int, ctl: int, jobs: int) -> None:
             try:
                 res = await worker_activity.run_worker(
                     worker_id, proxy=f'http://127.0.0.1:{mixed}',
-                    clash_base=f'http://127.0.0.1:{ctl}',
-                    clash_secret=SECRET, clash_group=GROUP,
                     jobs=jobs, progress=False)
                 log(f'      {worker_id} 正常退出: {res}')
                 return

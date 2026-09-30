@@ -2,9 +2,8 @@
 # -*- coding: utf-8 -*-
 """从机场订阅配置生成 N 个 worker 专用 mihomo 实例配置（clash_worker/w1..wN.yaml）
 
-原理：polymarket Data API 限流按出口 IP 计（200 req/10s），每个 worker 独占一个
-mihomo 实例（独立 mixed 端口 + 独立 selector 组），worker 通过 controller API
-在 429/403 时自动切换本实例节点换 IP（clash_pool.AsyncNodeRotator）。
+原理：每个 worker 独占一个 mihomo 实例（独立 mixed 端口）作为链式隧道代理的
+hop1 出海通道；节点固定使用，不做自动切换（出口 IP 轮换由隧道代理承担）。
 
 本模块是 poly.py 的配置生成库（也可单独 CLI 调用）：
     python make_worker_clash.py --n 3      # 显式生成（日常不用，poly.py 自动处理）
