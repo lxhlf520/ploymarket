@@ -74,7 +74,7 @@ async def cmd_stats() -> dict:
                 (SELECT count(*) FROM positions) AS positions,
                 (SELECT count(*) FROM price_history) AS price_points,
                 (SELECT count(*) FROM orderbook) AS orderbook_levels,
-                (SELECT count(*) FROM trades) AS trades
+                (SELECT count(*) FROM trades_slim) AS trades
             """
         ))
     return await db_pg.execute_with_retry(_do)

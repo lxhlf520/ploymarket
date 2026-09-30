@@ -23,38 +23,47 @@ logger = logging.getLogger(__name__)
 _pool = None
 
 SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS trades (
-    transaction_hash        TEXT        NOT NULL,
-    condition_id            TEXT        NOT NULL,
-    asset                   TEXT        NOT NULL,
-    outcome_index           SMALLINT    NOT NULL,
-    size                    NUMERIC     NOT NULL,
-    price                   NUMERIC     NOT NULL,
-    side                    TEXT        NOT NULL,
-    timestamp               BIGINT      NOT NULL,
-    proxy_wallet            TEXT        NOT NULL,
-    usdc_size               NUMERIC,
-    type                    TEXT        NOT NULL DEFAULT 'TRADE',
-    title                   TEXT,
-    slug                    TEXT,
-    event_slug              TEXT,
-    outcome                 TEXT,
-    icon                    TEXT,
-    name                    TEXT,
-    pseudonym               TEXT,
-    bio                     TEXT,
-    profile_image           TEXT,
-    profile_image_optimized TEXT,
-    raw_json                JSONB,
-    created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (transaction_hash, asset, outcome_index, size, timestamp, proxy_wallet, side)
-);
+CREATE TABLE IF NOT EXISTS trades_slim (
+    tx_hash       BYTEA        NOT NULL,
+    condition_id  BYTEA        NOT NULL,
+    asset         TEXT         NOT NULL,
+    outcome_index SMALLINT     NOT NULL,
+    size          NUMERIC      NOT NULL,
+    price_micro   BIGINT       NOT NULL,
+    side          TEXT         NOT NULL,
+    ts            BIGINT       NOT NULL,
+    wallet        BYTEA        NOT NULL,
+    usdc_size     NUMERIC,
+    type          TEXT         NOT NULL DEFAULT 'TRADE',
+    outcome       TEXT,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+) PARTITION BY RANGE (ts);
 
-CREATE INDEX IF NOT EXISTS idx_trades_condition_id ON trades (condition_id);
-CREATE INDEX IF NOT EXISTS idx_trades_proxy_wallet ON trades (proxy_wallet);
-CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades (timestamp);
-CREATE INDEX IF NOT EXISTS idx_trades_transaction_hash ON trades (transaction_hash);
-CREATE INDEX IF NOT EXISTS idx_trades_wallet_ts ON trades (proxy_wallet, timestamp DESC);
+-- 月分区 2021-01 .. 2027-12 动态生成（覆盖全量回填历史 + 未来增量缓冲）
+DO $$
+DECLARE
+    d date := date '2021-01-01';
+    e int;
+    s int;
+BEGIN
+    WHILE d < date '2028-01-01' LOOP
+        e := extract(epoch FROM d)::int;
+        s := extract(epoch FROM (d + interval '1 month'))::int;
+        EXECUTE format(
+            'CREATE TABLE IF NOT EXISTS trades_slim_%s PARTITION OF trades_slim '
+            'FOR VALUES FROM (%s) TO (%s)',
+            to_char(d, 'YYYYMM'), e, s);
+        d := (d + interval '1 month')::date;
+    END LOOP;
+END $$;
+
+-- 越界兜底分区（脏数据/时钟偏移不让写入直接报错）
+CREATE TABLE IF NOT EXISTS trades_slim_default PARTITION OF trades_slim DEFAULT;
+
+CREATE UNIQUE INDEX IF NOT EXISTS trades_slim_tx_asset_ts_idx ON trades_slim (tx_hash, asset, ts);
+CREATE INDEX IF NOT EXISTS trades_slim_condition_ts_idx ON trades_slim (condition_id, ts);
+CREATE INDEX IF NOT EXISTS trades_slim_wallet_ts_idx ON trades_slim (wallet, ts DESC);
+CREATE INDEX IF NOT EXISTS trades_slim_ts_brin ON trades_slim USING brin (ts);
 
 CREATE TABLE IF NOT EXISTS users (
     proxy_wallet            TEXT PRIMARY KEY,
@@ -260,31 +269,20 @@ CREATE INDEX IF NOT EXISTS idx_price_history_token ON price_history (token_id, t
 CREATE INDEX IF NOT EXISTS idx_orderbook_token ON orderbook (token_id, snapshot_at);
 
 -- ==================== 表/字段注释（COMMENT，幂等） ====================
-COMMENT ON TABLE trades IS '交易/活动明细（自然键去重，Phase A/B 共用）';
-COMMENT ON COLUMN trades.transaction_hash IS '链上交易哈希（自然键之一）';
-COMMENT ON COLUMN trades.condition_id IS '市场条件 ID（conditionId）';
-COMMENT ON COLUMN trades.asset IS '交易资产（代币地址/资产标识）';
-COMMENT ON COLUMN trades.outcome_index IS '结果索引（0=是/1=否）';
-COMMENT ON COLUMN trades.size IS '交易数量（股数）';
-COMMENT ON COLUMN trades.price IS '成交价格';
-COMMENT ON COLUMN trades.side IS '方向（BUY/SELL）';
-COMMENT ON COLUMN trades.timestamp IS '交易时间戳（秒）';
-COMMENT ON COLUMN trades.proxy_wallet IS '交易代理钱包地址';
-COMMENT ON COLUMN trades.usdc_size IS 'USDC 名义金额';
-COMMENT ON COLUMN trades.type IS '交易类型（TRADE/REDEEM/MERGE/SPLIT/REWARD/CONVERSION）';
-COMMENT ON COLUMN trades.title IS '市场标题（冗余快照）';
-COMMENT ON COLUMN trades.slug IS '市场 slug（冗余快照）';
-COMMENT ON COLUMN trades.event_slug IS '所属事件 slug';
-COMMENT ON COLUMN trades.outcome IS '结果名称（冗余快照）';
-COMMENT ON COLUMN trades.icon IS '市场图标 URL';
-COMMENT ON COLUMN trades.name IS '交易者昵称（冗余快照）';
-COMMENT ON COLUMN trades.pseudonym IS '交易者匿名名（冗余快照）';
-COMMENT ON COLUMN trades.bio IS '交易者简介（冗余快照）';
-COMMENT ON COLUMN trades.profile_image IS '交易者头像 URL（冗余快照）';
-COMMENT ON COLUMN trades.profile_image_optimized IS '交易者头像优化版 URL（冗余快照）';
-COMMENT ON COLUMN trades.event_id IS '所属事件 ID（activity 维度补充）';
-COMMENT ON COLUMN trades.raw_json IS 'API 原始响应 JSON';
-COMMENT ON COLUMN trades.created_at IS '入库时间';
+COMMENT ON TABLE trades_slim IS '交易/活动明细瘦身分区表（按月 RANGE，自然键 tx_hash+asset+ts 去重，Phase A/B 共用）';
+COMMENT ON COLUMN trades_slim.tx_hash IS '链上交易哈希（bytea，去 0x 前缀后的二进制）';
+COMMENT ON COLUMN trades_slim.condition_id IS '市场条件 ID（bytea，去 0x 前缀后的二进制）';
+COMMENT ON COLUMN trades_slim.asset IS '交易资产（代币地址）';
+COMMENT ON COLUMN trades_slim.outcome_index IS '结果索引（0=是/1=否）';
+COMMENT ON COLUMN trades_slim.size IS '交易数量（股数）';
+COMMENT ON COLUMN trades_slim.price_micro IS '成交价格（定点化，原价 x 1000000）';
+COMMENT ON COLUMN trades_slim.side IS '方向（BUY/SELL）';
+COMMENT ON COLUMN trades_slim.ts IS '交易时间戳（秒，分区键）';
+COMMENT ON COLUMN trades_slim.wallet IS '交易代理钱包地址（bytea）';
+COMMENT ON COLUMN trades_slim.usdc_size IS 'USDC 名义金额';
+COMMENT ON COLUMN trades_slim.type IS '交易类型（TRADE/REDEEM/MERGE/SPLIT/REWARD/CONVERSION）';
+COMMENT ON COLUMN trades_slim.outcome IS '结果名称';
+COMMENT ON COLUMN trades_slim.created_at IS '入库时间';
 
 COMMENT ON TABLE users IS '用户聚合画像（由 trades 聚合刷新）';
 COMMENT ON COLUMN users.proxy_wallet IS '钱包地址（主键）';
@@ -463,30 +461,32 @@ COMMENT ON COLUMN activity_tasks.updated_at IS '最后更新时间';
 """
 
 UPSERT_TRADES_SQL = """
-INSERT INTO trades (
-    transaction_hash, condition_id, asset, outcome_index, size, price, side,
-    timestamp, proxy_wallet, usdc_size, type, title, slug, event_slug, outcome,
-    icon, name, pseudonym, bio, profile_image, profile_image_optimized, event_id, raw_json
+INSERT INTO trades_slim (
+    tx_hash, condition_id, asset, outcome_index, size, price_micro, side,
+    ts, wallet, usdc_size, type, outcome
 )
 SELECT * FROM (
-    SELECT DISTINCT ON (transaction_hash, asset, outcome_index, size, timestamp, proxy_wallet, side) *
+    SELECT DISTINCT ON (tx_hash, asset, ts) *
     FROM unnest(
-        $1::text[], $2::text[], $3::text[], $4::smallint[], $5::numeric[], $6::numeric[],
-        $7::text[], $8::bigint[], $9::text[], $10::numeric[], $11::text[], $12::text[],
-        $13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[],
-        $19::text[], $20::text[], $21::text[], $22::text[], $23::jsonb[]
-    ) AS t(transaction_hash, condition_id, asset, outcome_index, size, price, side,
-           timestamp, proxy_wallet, usdc_size, type, title, slug, event_slug, outcome,
-           icon, name, pseudonym, bio, profile_image, profile_image_optimized, event_id, raw_json)
-    ORDER BY transaction_hash, asset, outcome_index, size, timestamp, proxy_wallet, side
+        $1::bytea[], $2::bytea[], $3::text[], $4::smallint[], $5::numeric[], $6::bigint[],
+        $7::text[], $8::bigint[], $9::bytea[], $10::numeric[], $11::text[], $12::text[]
+    ) AS t(tx_hash, condition_id, asset, outcome_index, size, price_micro, side,
+           ts, wallet, usdc_size, type, outcome)
+    ORDER BY tx_hash, asset, ts
 ) d
-ON CONFLICT (transaction_hash, asset, outcome_index, size, timestamp, proxy_wallet, side)
+ON CONFLICT (tx_hash, asset, ts)
 DO UPDATE SET
-    usdc_size = COALESCE(trades.usdc_size, EXCLUDED.usdc_size),
-    type      = EXCLUDED.type,
-    event_id  = COALESCE(trades.event_id, EXCLUDED.event_id),
-    raw_json  = COALESCE(trades.raw_json, EXCLUDED.raw_json)
-RETURNING (xmax = 0) AS inserted
+    usdc_size = COALESCE(trades_slim.usdc_size, EXCLUDED.usdc_size),
+    outcome   = COALESCE(trades_slim.outcome, EXCLUDED.outcome),
+    type      = EXCLUDED.type
+"""
+
+# PG15 分区表不支持 RETURNING 系统列（xmax），inserted/updated 改由写入前
+# 预查询已存在键计数区分（唯一索引点查，每批一次，开销可忽略）
+COUNT_EXISTING_TRADES_SQL = """
+SELECT count(*)
+FROM unnest($1::bytea[], $2::text[], $3::bigint[]) AS k(tx_hash, asset, ts)
+JOIN trades_slim USING (tx_hash, asset, ts)
 """
 
 UPSERT_RECEIPTS_SQL = """
@@ -635,19 +635,31 @@ async def init_schema() -> None:
     logger.info('schema 初始化完成')
 
 
+UPSERT_USER_PROFILES_SQL = """
+INSERT INTO users (proxy_wallet, name, pseudonym, bio, profile_image, profile_image_optimized)
+SELECT * FROM unnest(
+    $1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[]
+) AS t(proxy_wallet, name, pseudonym, bio, profile_image, profile_image_optimized)
+ON CONFLICT (proxy_wallet) DO UPDATE SET
+    name = COALESCE(EXCLUDED.name, users.name),
+    pseudonym = COALESCE(EXCLUDED.pseudonym, users.pseudonym),
+    bio = COALESCE(EXCLUDED.bio, users.bio),
+    profile_image = COALESCE(EXCLUDED.profile_image, users.profile_image),
+    profile_image_optimized = COALESCE(EXCLUDED.profile_image_optimized, users.profile_image_optimized),
+    updated_at = now()
+"""
+
+
 def _dedupe_rows(rows: list) -> list:
-    """同批内按自然键去重：重复行保留信息更全的一条（有 usdcSize 者优先）。
-    分页边界会重复返回同一行，unnest 批量 INSERT 撞到同批重复键会直接报错。"""
+    """同批内按自然键 (txHash, asset, timestamp) 去重：重复行保留信息更全的一条
+    （有 usdcSize 者优先）。分页边界会重复返回同一行，unnest 批量 INSERT
+    撞到同批重复键会直接报错。"""
     seen = {}
     for r in rows:
         key = (
             r.get('transactionHash') or '',
             r.get('asset') or '',
-            int(r.get('outcomeIndex')) if r.get('outcomeIndex') is not None else -1,
-            float(r.get('size') or 0),
             int(r.get('timestamp') or 0),
-            r.get('proxyWallet') or '',
-            r.get('side') or '',
         )
         prev = seen.get(key)
         if prev is None or (prev.get('usdcSize') is None and r.get('usdcSize') is not None):
@@ -655,46 +667,68 @@ def _dedupe_rows(rows: list) -> list:
     return list(seen.values())
 
 
+def _hex2bytes(s) -> bytes:
+    """'0x...' hex 文本 → bytes（空值返回 b''，与旧表空串行为一致）"""
+    if not s:
+        return b''
+    return bytes.fromhex(s[2:] if s.startswith('0x') else s)
+
+
 def _rows_to_arrays(rows: list) -> list:
-    """把 API 原始行归一化为 unnest 数组（22 列）"""
-    tx_hashes, cids, assets, oidxs, sizes, prices = [], [], [], [], [], []
-    sides, tss, wallets, usdcs, types_ = [], [], [], [], []
-    titles, slugs, eslugs, outcomes, icons = [], [], [], [], []
-    names, pseu, bios, pimgs, pimgs_o, evt_ids, raws = [], [], [], [], [], [], []
+    """把 API 原始行归一化为 unnest 数组（12 列）。
+
+    hex 文本 → bytea（tx_hash/condition_id/wallet），price → price_micro 定点化
+    （round(price*1e6)，消除 float 垃圾精度位）。"""
+    tx, cids, assets, oidxs, sizes, prices = [], [], [], [], [], []
+    sides, tss, wallets, usdcs, types_, outcomes = [], [], [], [], [], []
 
     for r in rows:
-        tx_hashes.append(r.get('transactionHash') or '')
-        cids.append(r.get('conditionId') or '')
+        tx.append(_hex2bytes(r.get('transactionHash')))
+        cids.append(_hex2bytes(r.get('conditionId')))
         assets.append(r.get('asset') or '')
         oi = r.get('outcomeIndex')
         oidxs.append(int(oi) if oi is not None else -1)
         sizes.append(float(r.get('size') or 0))
-        prices.append(float(r.get('price') or 0))
+        prices.append(round(float(r.get('price') or 0) * 1000000))
         sides.append(r.get('side') or '')
         tss.append(int(r.get('timestamp') or 0))
-        wallets.append(r.get('proxyWallet') or '')
+        wallets.append(_hex2bytes(r.get('proxyWallet')))
         usdcs.append(float(r['usdcSize']) if r.get('usdcSize') is not None else None)
         types_.append(r.get('type') or 'TRADE')
-        titles.append(r.get('title'))
-        slugs.append(r.get('slug'))
-        eslugs.append(r.get('eventSlug'))
         outcomes.append(r.get('outcome'))
-        icons.append(r.get('icon'))
+
+    return [tx, cids, assets, oidxs, sizes, prices, sides, tss, wallets,
+            usdcs, types_, outcomes]
+
+
+def _profiles_to_arrays(rows: list) -> list:
+    """batch 内按 wallet 提取最新非空画像（瘦身后 trades 不再存画像列，写入时顺带聚合进 users）"""
+    best = {}
+    for r in rows:
+        w = r.get('proxyWallet') or ''
+        if not w:
+            continue
+        if not any(r.get(k) for k in ('name', 'pseudonym', 'bio', 'profileImage', 'profileImageOptimized')):
+            continue
+        prev = best.get(w)
+        if prev is None or int(r.get('timestamp') or 0) >= int(prev.get('timestamp') or 0):
+            best[w] = r
+    wallets, names, pseu, bios, pimgs, pimgs_o = [], [], [], [], [], []
+    for w, r in best.items():
+        wallets.append(w)
         names.append(r.get('name'))
         pseu.append(r.get('pseudonym'))
         bios.append(r.get('bio'))
         pimgs.append(r.get('profileImage'))
         pimgs_o.append(r.get('profileImageOptimized'))
-        evt_ids.append(str(r['eventId']) if r.get('eventId') is not None else None)
-        raws.append(json.dumps(r, ensure_ascii=False))
-
-    return [tx_hashes, cids, assets, oidxs, sizes, prices, sides, tss, wallets,
-            usdcs, types_, titles, slugs, eslugs, outcomes, icons, names, pseu,
-            bios, pimgs, pimgs_o, evt_ids, raws]
+    return [wallets, names, pseu, bios, pimgs, pimgs_o]
 
 
 async def upsert_trades(rows: list) -> tuple:
-    """批量 upsert 交易行，返回 (inserted, updated)。自然键去重，冲突时富化 usdc_size/type。"""
+    """批量 upsert 交易行到 trades_slim，返回 (inserted, updated)。
+
+    自然键 (tx_hash, asset, ts) 去重，冲突时富化 usdc_size/outcome/type；
+    瘦身后画像列不入 trades_slim，batch 内非空画像顺带 upsert 进 users。"""
     if not rows:
         return 0, 0
 
@@ -702,21 +736,27 @@ async def upsert_trades(rows: list) -> tuple:
     arrays = _rows_to_arrays(rows)
 
     async def _do(conn):
-        res = await conn.fetch(UPSERT_TRADES_SQL, *arrays)
-        inserted = sum(1 for rec in res if rec['inserted'])
-        return inserted, len(res) - inserted
+        existed = int(await conn.fetchval(
+            COUNT_EXISTING_TRADES_SQL, arrays[0], arrays[2], arrays[7]) or 0)
+        await conn.execute(UPSERT_TRADES_SQL, *arrays)
+        inserted = len(arrays[0]) - existed
+        prof = _profiles_to_arrays(rows)
+        if prof[0]:
+            await conn.fetch(UPSERT_USER_PROFILES_SQL, *prof)
+        return inserted, existed
 
     return await execute_with_retry(_do)
 
 
 async def refresh_users() -> dict:
-    """从 trades 聚合刷新 users 表（笔数、时间范围、画像字段），返回统计"""
+    """从 trades_slim 聚合刷新 users 计数/时间范围（画像已在写入时顺带 upsert），返回统计"""
     async def _do(conn):
         await conn.execute(
             """
             INSERT INTO users (proxy_wallet, trade_count, first_trade_ts, last_trade_ts)
-            SELECT proxy_wallet, count(*), min(timestamp), max(timestamp)
-            FROM trades GROUP BY proxy_wallet
+            SELECT w, count(*), min(ts), max(ts) FROM (
+                SELECT '0x' || encode(wallet, 'hex') AS w, ts FROM trades_slim
+            ) t GROUP BY w
             ON CONFLICT (proxy_wallet) DO UPDATE SET
                 trade_count = EXCLUDED.trade_count,
                 first_trade_ts = EXCLUDED.first_trade_ts,
@@ -725,23 +765,6 @@ async def refresh_users() -> dict:
             """
         )
         total = await conn.fetchval("SELECT count(*) FROM users")
-        # 画像字段取每个用户最新非空值
-        await conn.execute(
-            """
-            INSERT INTO users (proxy_wallet, name, pseudonym, bio, profile_image, profile_image_optimized)
-            SELECT DISTINCT ON (proxy_wallet) proxy_wallet, name, pseudonym, bio, profile_image, profile_image_optimized
-            FROM trades
-            WHERE COALESCE(name, '') <> '' OR COALESCE(pseudonym, '') <> ''
-            ORDER BY proxy_wallet, timestamp DESC
-            ON CONFLICT (proxy_wallet) DO UPDATE SET
-                name = COALESCE(EXCLUDED.name, users.name),
-                pseudonym = COALESCE(EXCLUDED.pseudonym, users.pseudonym),
-                bio = COALESCE(EXCLUDED.bio, users.bio),
-                profile_image = COALESCE(EXCLUDED.profile_image, users.profile_image),
-                profile_image_optimized = COALESCE(EXCLUDED.profile_image_optimized, users.profile_image_optimized),
-                updated_at = now()
-            """
-        )
         return {'user_count': total}
 
     return await execute_with_retry(_do)
@@ -802,22 +825,22 @@ async def get_pending_tx_hashes(after_hash: str, limit: int) -> list:
     async def _do(conn):
         res = await conn.fetch(
             """
-            SELECT transaction_hash
-            FROM trades
-            WHERE transaction_hash <> '' AND transaction_hash > $1
+            SELECT '0x' || encode(tx_hash, 'hex') AS h
+            FROM trades_slim
+            WHERE tx_hash <> ''::bytea
+              AND ($1 = '' OR tx_hash > decode(substr($1, 3), 'hex'))
               AND NOT EXISTS (
                   SELECT 1 FROM tx_receipts r
-                  WHERE r.transaction_hash = trades.transaction_hash
+                  WHERE r.transaction_hash = '0x' || encode(tx_hash, 'hex')
                     AND (NOT r.failed
                          OR r.fetched_at > now() - make_interval(hours => $3::int))
               )
-            GROUP BY transaction_hash
-            ORDER BY transaction_hash
+            ORDER BY tx_hash
             LIMIT $2
             """,
             after_hash, limit, config.TX_RETRY_COOLDOWN_HOURS,
         )
-        return [r['transaction_hash'] for r in res]
+        return [r['h'] for r in res]
 
     return await execute_with_retry(_do)
 
@@ -828,12 +851,12 @@ async def count_pending_tx_hashes() -> int:
         return await conn.fetchval(
             """
             SELECT count(*) FROM (
-                SELECT DISTINCT transaction_hash
-                FROM trades
-                WHERE transaction_hash <> ''
+                SELECT DISTINCT tx_hash
+                FROM trades_slim
+                WHERE tx_hash <> ''::bytea
                   AND NOT EXISTS (
                       SELECT 1 FROM tx_receipts r
-                      WHERE r.transaction_hash = trades.transaction_hash AND NOT r.failed
+                      WHERE r.transaction_hash = '0x' || encode(tx_hash, 'hex') AND NOT r.failed
                   )
             ) t
             """
@@ -847,12 +870,12 @@ async def count_pending_wallets() -> int:
     async def _do(conn):
         return await conn.fetchval(
             """
-            SELECT count(DISTINCT proxy_wallet)
-            FROM trades
-            WHERE proxy_wallet <> ''
+            SELECT count(DISTINCT ('0x' || encode(wallet, 'hex')))
+            FROM trades_slim
+            WHERE wallet <> ''::bytea
               AND NOT EXISTS (
                   SELECT 1 FROM scrape_progress p
-                  WHERE p.scope = 'user:' || proxy_wallet AND p.state = 'done'
+                  WHERE p.scope = 'user:' || ('0x' || encode(wallet, 'hex')) AND p.state = 'done'
               )
             """
         )
@@ -1104,7 +1127,7 @@ async def get_tx_stats() -> dict:
     """链上回填覆盖度统计"""
     async def _do(conn):
         total = await conn.fetchval(
-            "SELECT count(DISTINCT transaction_hash) FROM trades WHERE transaction_hash <> ''"
+            "SELECT count(DISTINCT tx_hash) FROM trades_slim WHERE tx_hash <> ''::bytea"
         )
         done = await conn.fetchval(
             "SELECT count(*) FROM tx_receipts WHERE NOT failed"
@@ -1306,19 +1329,19 @@ async def get_pending_wallets(limit: int) -> list:
     async def _do(conn):
         res = await conn.fetch(
             """
-            SELECT DISTINCT proxy_wallet
-            FROM trades
-            WHERE proxy_wallet <> ''
+            SELECT DISTINCT '0x' || encode(wallet, 'hex') AS w
+            FROM trades_slim
+            WHERE wallet <> ''::bytea
               AND NOT EXISTS (
                   SELECT 1 FROM scrape_progress p
-                  WHERE p.scope = 'user:' || proxy_wallet AND p.state = 'done'
+                  WHERE p.scope = 'user:' || ('0x' || encode(wallet, 'hex')) AND p.state = 'done'
               )
-            ORDER BY proxy_wallet
+            ORDER BY w
             LIMIT $1
             """,
             limit,
         )
-        return [r['proxy_wallet'] for r in res]
+        return [r['w'] for r in res]
 
     return await execute_with_retry(_do)
 
@@ -1329,7 +1352,7 @@ async def get_stats() -> dict:
         row = await conn.fetchrow(
             """
             SELECT
-                (SELECT count(*) FROM trades) AS trades,
+                (SELECT count(*) FROM trades_slim) AS trades,
                 (SELECT count(*) FROM users) AS users,
                 (SELECT count(*) FROM tx_receipts) AS receipts,
                 (SELECT count(*) FROM scrape_progress WHERE state = 'done') AS done_scopes

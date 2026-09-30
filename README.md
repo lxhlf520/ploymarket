@@ -16,11 +16,11 @@ python poly.py                    # 唯一入口：建库 → 代理池配置 �
 
 | 表 | 说明 |
 |---|---|
-| `trades` | 每笔交易/活动明细（19+ 字段 + raw_json），自然键去重，Phase A/B 共用 |
+| `trades_slim` | 每笔交易/活动明细瘦身分区表（按月 RANGE；hex→bytea、price 定点化为 price_micro（原价×1e6）、去 raw_json 与展示列，实测 547 B/行 ≈ 原结构 1/4），自然键 (tx_hash, asset, ts) 去重，Phase A/B 共用；展示/画像信息不在成交行上抄写，需要时 join `markets`/`users` |
 | `events` | 事件 + 嵌套市场（Gamma 采集落地，也是 worker 任务队列的数据源） |
 | `markets` | 市场详情（clobTokenIds / 描述等，details 阶段补拉） |
 | `activity_tasks` | worker 任务队列（event 级状态机 pending/running/done/failed + 租约） |
-| `users` | 用户聚合画像（笔数、时间范围、昵称/头像，从 trades 聚合刷新） |
+| `users` | 用户聚合画像（笔数、时间范围、昵称/头像；画像在 trades 写入时顺带 upsert，计数用 `main_collect.py` stats 刷新） |
 | `tx_receipts` | Polygon 链上收据（区块号/区块时间/gas/status/from/to 等），按哈希去重回填一次 |
 | `blocks` | 区块时间戳缓存（避免重复 `eth_getBlockByNumber`） |
 | `scrape_progress` | 断点续传进度（scope 粒度：`market:{conditionId}` / `user:{wallet}`） |
@@ -160,7 +160,7 @@ python main_trades.py --stage markets --market <conditionId>  # 定向单市场�
 - Data API 限流（200 req/10s）按**出口 IP** 计——单机加线程无益，**多 worker 进程各走独立隧道代理**（独立出口 IP）才能线性扩吞吐
 - 任务队列存 PG `activity_tasks` 表（event 级状态机：`pending 等待 → running 采集中 → done 完成 / failed 错误`）
 - 领取用 `FOR UPDATE SKIP LOCKED` 原子操作：多 worker 并发领取**永不重复**；worker 被强杀后其 running 任务**租约超时自动回收**，其他 worker 接管
-- 多 worker 写同一 PG 库：trades upsert 幂等，无脏数据
+- 多 worker 写同一 PG 库：trades_slim upsert 幂等，无脏数据
 
 ### 启动（唯一入口：poly.py）
 

@@ -658,7 +658,7 @@ async def _db_status() -> dict:
             tasks[r['status']] = r['n']
         return {
             'events': await conn.fetchval('SELECT count(*) FROM events'),
-            'trades': await conn.fetchval('SELECT count(*) FROM trades'),
+            'trades': await conn.fetchval('SELECT count(*) FROM trades_slim'),
             'users': await conn.fetchval('SELECT count(*) FROM users'),
             'tasks': tasks,
         }
