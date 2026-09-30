@@ -259,7 +259,6 @@ ALTER TABLE markets ADD COLUMN IF NOT EXISTS fee_schedule JSONB;
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id TEXT;
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_entity_type TEXT;
 ALTER TABLE comments ADD COLUMN IF NOT EXISTS reactions JSONB;
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS event_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_events_slug ON events (slug);
 CREATE INDEX IF NOT EXISTS idx_markets_event_id ON markets (event_id);
 CREATE INDEX IF NOT EXISTS idx_clarifications_market ON market_clarifications (market_id);
@@ -284,7 +283,7 @@ COMMENT ON COLUMN trades_slim.type IS '交易类型（TRADE/REDEEM/MERGE/SPLIT/R
 COMMENT ON COLUMN trades_slim.outcome IS '结果名称';
 COMMENT ON COLUMN trades_slim.created_at IS '入库时间';
 
-COMMENT ON TABLE users IS '用户聚合画像（由 trades 聚合刷新）';
+COMMENT ON TABLE users IS '用户聚合画像（画像在 trades_slim 写入时顺带 upsert，计数可 refresh_users 聚合刷新）';
 COMMENT ON COLUMN users.proxy_wallet IS '钱包地址（主键）';
 COMMENT ON COLUMN users.name IS '昵称（最新非空值）';
 COMMENT ON COLUMN users.pseudonym IS '匿名名（最新非空值）';
