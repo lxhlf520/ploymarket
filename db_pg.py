@@ -515,18 +515,30 @@ ON CONFLICT (block_number) DO NOTHING
 
 
 def ensure_database() -> None:
-    """创建 polymarket 库（不存在时），同步用 psycopg2 连接管理库执行"""
+    """创建 polymarket 库（不存在时），同步用 psycopg2 连接管理库执行。
+
+    远程/托管实例常禁止连 postgres 管理库：连接或查询失败时降级为
+    "假设库已存在"继续（init_schema 会给出清晰报错），不再阻断启动。"""
     import psycopg2
 
-    conn = psycopg2.connect(config.PG_ADMIN_DSN)
-    conn.autocommit = True
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (config.PG_DB,))
-    if not cur.fetchone():
-        cur.execute(f'CREATE DATABASE "{config.PG_DB}"')
-        logger.info('已创建数据库 %s', config.PG_DB)
-    cur.close()
-    conn.close()
+    try:
+        conn = psycopg2.connect(config.PG_ADMIN_DSN, connect_timeout=10)
+    except Exception as exc:
+        logger.warning('无法连接 postgres 管理库（远程托管实例常见），假设 %s 库已存在继续: %s',
+                       config.PG_DB, exc)
+        return
+    try:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (config.PG_DB,))
+        if not cur.fetchone():
+            cur.execute(f'CREATE DATABASE "{config.PG_DB}"')
+            logger.info('已创建数据库 %s', config.PG_DB)
+        cur.close()
+    except Exception as exc:
+        logger.warning('建库检查失败（若 %s 已存在可忽略）: %s', config.PG_DB, exc)
+    finally:
+        conn.close()
 
 
 async def get_pool() -> asyncpg.Pool:

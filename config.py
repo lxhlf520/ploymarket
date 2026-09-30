@@ -138,15 +138,17 @@ CLOB_API_BASE = 'https://clob.polymarket.com'
 # 登录态 Cookie 文件（浏览器登录后 export_cookie.py 导出，评论全量采集用）
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.json')
 
-# 本地 PostgreSQL（新建库 polymarket，与 yelp/dailymail 等库同实例）
-# 连接信息从 .env / 环境变量读取（参考 .env.example），密码不硬编码
+# PostgreSQL（本地或远程实例均用同一套配置；连接信息从 .env / 环境变量读取，
+# 参考 .env.example，密码不硬编码）
 PG_HOST = os.environ.get('PG_HOST', 'localhost')
 PG_PORT = int(os.environ.get('PG_PORT', '5432'))
 PG_USER = os.environ.get('PG_USER', 'postgres')
 PG_PASSWORD = os.environ.get('PG_PASSWORD', '')
 PG_DB = os.environ.get('PG_DB', 'polymarket')
-PG_DSN = f'postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}'
-PG_ADMIN_DSN = f'postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/postgres'
+# 密码 URL 编码：远程库密码常含 @ : / 等特殊字符，不编码 DSN 拼接直接炸
+from urllib.parse import quote_plus as _qp
+PG_DSN = f'postgresql://{_qp(PG_USER)}:{_qp(PG_PASSWORD)}@{PG_HOST}:{PG_PORT}/{PG_DB}'
+PG_ADMIN_DSN = f'postgresql://{_qp(PG_USER)}:{_qp(PG_PASSWORD)}@{PG_HOST}:{PG_PORT}/postgres'
 PG_POOL_MIN = 4
 PG_POOL_MAX = 16
 
