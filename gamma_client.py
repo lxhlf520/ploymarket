@@ -9,7 +9,9 @@
 - /markets                     单盘口详情（slug= / condition_id=）与全量列表（limit<=100）
 - /events/{id}、/events/slug/{slug}  事件详情（含嵌套 markets）
 - /market-clarifications       Rules 澄清（按 market_id）
-- /comments                    评论（parent_entity_type=Event/Market，登录态才可全量翻页）
+- /comments/keyset            评论（parent_entity_type=Event/Market，after_cursor 游标
+-                              翻页无上限，实测未登录也可全量；旧 /comments offset 翻页
+-                              已被服务端 422 废弃）
 - /is-logged-in                登录状态探测
 
 限流：与 Data API 同为 Cloudflare 保护，沿用 200 次/10s 令牌桶 + 指数退避；
@@ -149,16 +151,23 @@ class GammaAPIClient:
     # ---------- 评论 / 登录态 ----------
 
     async def get_comments(self, parent_entity_type: str, parent_entity_id,
-                           limit: int = 50, offset: int = 0) -> list:
-        """评论单页（parent_entity_type: Event/Market）"""
-        data = await self._get('/comments', {
+                           after_cursor: str = None) -> tuple:
+        """评论 keyset 单页，返回 (comments, next_cursor)。
+
+        实测约束：旧 /comments offset 翻页被 "offset too large" 422 拒绝（约 250 条硬上限），
+        官方提示改用 /comments/keyset：after_cursor 游标可无上限全量翻页，
+        且未登录可用（登录态不再是硬依赖）；单页条数由评论树结构决定（约 20~140），
+        limit 参数不生效故不再传。"""
+        params = {
             'parent_entity_type': parent_entity_type,
             'parent_entity_id': parent_entity_id,
-            'limit': limit,
-            'offset': offset,
-            'order': 'createdAt',
-        })
-        return data if isinstance(data, list) else []
+        }
+        if after_cursor:
+            params['after_cursor'] = after_cursor
+        data = await self._get('/comments/keyset', params)
+        if isinstance(data, list):
+            return data, None
+        return data.get('comments', []), data.get('next_cursor') or None
 
     async def is_logged_in(self) -> bool:
         """登录态探测（401 未登录 / 200 已登录）"""

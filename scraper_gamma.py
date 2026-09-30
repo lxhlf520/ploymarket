@@ -9,8 +9,8 @@
 - 澄清:      scope='clarif'，state 存最后 condition_id
 - 评论:      scope='comments:{event_id}'，完成标记 done；事件队列游标 scope='comments_resume'
 
-实测接口约束（2026-08 实测，以此为准）：
-- /events/keyset 的 offset 参数一律 422（offset not allowed），next_cursor 失效（返回同页）
+实测接口约束（2026-09-30 实测，以此为准）：
+- /events/keyset 的 offset 参数一律 422（offset not allowed），next_cursor 实测失效（返回同页）
 - /events 的 offset 上限 2000，超限 422（提示改用 keyset）——两接口均无法全量翻页
 - /markets 的 offset 上限 2000（任何参数组合），超限 422；
   全量市场覆盖主路径：/events/keyset?slug= 批量（≤100）遍历全部事件，
@@ -18,8 +18,9 @@
 - /markets 的 condition_id 参数被忽略，详情只能按 slug 单查
 - /market-clarifications 只接受市场数字 id（raw_json.id）
 
-评论登录态：未登录时每页仅返回 10 条且翻页受限，
-需先 export_cookie.py 导出浏览器 Cookie 到 cookies.json 后采集。
+评论翻页：旧 /comments offset 翻页已被服务端 422 废弃（"offset too large"，约 250 条硬上限），
+已切换 /comments/keyset + after_cursor 游标：无上限全量翻页，实测未登录也可全量，
+登录态（export_cookie.py 导出 cookies.json）仅作冗余保障。
 """
 
 import asyncio
@@ -315,27 +316,33 @@ async def _scrape_event_comments(api: GammaAPIClient, event_id: str) -> tuple:
         return 0, 0
 
     inserted = updated = 0
-    offset = 0
+    cursor = None
+    seen_ids = set()
     while True:
-        page = await api.get_comments(
-            'Event', event_id, limit=config.COMMENTS_LIMIT, offset=offset)
+        page, next_cursor = await api.get_comments('Event', event_id,
+                                                   after_cursor=cursor)
         if not page:
             break
+        fresh = 0
         for c in page:
+            if c.get('id') in seen_ids:
+                continue  # 游标边界防重
+            seen_ids.add(c.get('id'))
+            fresh += 1
             c.setdefault('event_id', str(event_id))
             c.setdefault('parent_entity_type', 'Event')
             batch.append(c)
-        total += len(page)
+        total += fresh
         if len(batch) >= config.COMMENTS_LIMIT * COMMENTS_BATCH:
             ins, upd = await _flush()
             inserted += ins
             updated += upd
-        if len(page) < config.COMMENTS_LIMIT:
+        if not next_cursor:
             break
-        offset += len(page)
-        # 防死循环：同一 offset 重复返回时中止
-        if offset > 100_000:
-            logger.warning('事件 %s 评论 offset 超限，提前中止', event_id)
+        cursor = next_cursor
+        # 防死循环：单事件评论数异常超限
+        if len(seen_ids) > 100_000:
+            logger.warning('事件 %s 评论数异常超限，提前中止', event_id)
             break
     ins, upd = await _flush()
     inserted += ins
@@ -352,10 +359,8 @@ async def scrape_comments(event_id: str = None, limit: int = None,
 
     async with GammaAPIClient() as api:
         logged_in = await api.is_logged_in()
-        logger.info('登录态探测: %s%s', logged_in,
-                    '' if logged_in else '（未登录，评论每页仅 10 条，建议先 export_cookie.py）')
-        if not logged_in and not event_id:
-            logger.warning('未登录时评论翻页受限，继续尝试采集（可能不完整）')
+        # 实测：/comments/keyset 游标翻页未登录即可全量，登录态仅作冗余保障
+        logger.info('登录态探测: %s（keyset 翻页未登录也可全量）', logged_in)
 
         if event_id:
             event_ids = [str(event_id)]
