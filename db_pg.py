@@ -1055,6 +1055,32 @@ async def upsert_comments(rows: list) -> tuple:
         except (json.JSONDecodeError, TypeError):
             return None
 
+    def _comment_profiles(rows: list) -> list:
+        """从评论行 profile 对象提取作者画像，返回与 _profiles_to_arrays 同构的 6 数组。
+
+        主键优先 profile.proxyWallet（与 users.proxy_wallet 语义一致，跨 trades/comments
+        合并同一用户），缺失时回退 user_address（baseAddress）。"""
+        best = {}
+        for r in rows:
+            p = _to_json(r.get('profile_json') or r.get('profileJson') or r.get('profile'))
+            if not isinstance(p, dict):
+                continue
+            w = p.get('proxyWallet') or r.get('user_address') or r.get('userAddress')
+            if not w:
+                continue
+            if not any(p.get(k) for k in ('name', 'pseudonym', 'bio', 'profileImage')):
+                continue
+            best[w] = p
+        wallets, names, pseu, bios, pimgs, pimgs_o = [], [], [], [], [], []
+        for w, p in best.items():
+            wallets.append(w)
+            names.append(p.get('name'))
+            pseu.append(p.get('pseudonym'))
+            bios.append(p.get('bio'))
+            pimgs.append(p.get('profileImage'))
+            pimgs_o.append(p.get('profileImageOptimized'))
+        return [wallets, names, pseu, bios, pimgs, pimgs_o]
+
     ids, event_ids, bodies = [], [], []
     user_addresses, author_names = [], []
     reaction_counts, report_counts = [], []
@@ -1108,6 +1134,9 @@ async def upsert_comments(rows: list) -> tuple:
             reactions_list, raw_json_list,
         )
         inserted = sum(1 for r in res if r['inserted'])
+        prof = _comment_profiles(rows)
+        if prof[0]:
+            await conn.fetch(UPSERT_USER_PROFILES_SQL, *prof)
         return inserted, len(res) - inserted
 
     return await execute_with_retry(_do)
